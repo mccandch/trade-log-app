@@ -1,0 +1,9 @@
+streamlit==1.37.0
+pandas>=2.0
+numpy>=1.24
+gspread==6.1.2
+gspread-dataframe==3.3.1
+google-auth==2.30.0
+python-dateutil>=2.8.2
+watchdog==4.0.1
+pyotp==2.9.0
