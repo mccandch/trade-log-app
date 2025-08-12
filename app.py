@@ -1,15 +1,35 @@
+#!/usr/bin/env python3
+# Run locally:
+#   streamlit run app.py --server.fileWatcherType poll --server.runOnSave true
+
 import streamlit as st
 import tabs.daily_compare as dc
 import tabs.live_vs_backtest as lvb
 
-st.set_page_config(page_title="Trade Tools — Daily Compare & Live vs Backtest", layout="wide")
+# Must be the first Streamlit call:
+st.set_page_config(
+    page_title="Trade Tools — Daily Compare & Live vs Backtest",
+    layout="wide",
+)
+
 st.title("Trade Tools")
 
-tabs = st.tabs(["Daily Compare", "Live vs Backtest"])
-with tabs[0]:
-    # if your function is dc.daily_compare_tab(), this still works
-    # if it’s dc.daily_compare(), this also works—adjust the name below to match
-    dc.daily_compare_tab() if hasattr(dc, "daily_compare_tab") else dc.daily_compare()
+# Global compact-table styling (used by Live-vs-Backtest and Daily Compare)
+st.markdown(
+    """
+<style>
+.compact-table { width: 100% !important; }
+.compact-table table { width: 100% !important; table-layout: auto !important; border-collapse: collapse; }
+.compact-table th, .compact-table td { white-space: nowrap; padding: 6px 10px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-with tabs[1]:
+tab1, tab2 = st.tabs(["Daily Compare", "Live vs Backtest"])
+
+with tab1:
+    dc.daily_compare_tab()
+
+with tab2:
     lvb.live_vs_backtest_tab()
