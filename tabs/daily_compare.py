@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -83,7 +84,8 @@ def render_daily_card(title, df):
 def daily_compare_tab():
     st.subheader("Daily Compare (Google Sheets)")
 
-    if st.button("Refresh data"):
+    # Refresh
+    if st.button("Refresh data", key="dc_btn_refresh"):
         load_sheets_data.clear()
         _rerun()
 
@@ -92,20 +94,82 @@ def daily_compare_tab():
         st.info("No data found yet. Start your watchers (Raw_Chad / Raw_Kelly) and click Refresh.")
         return
 
+    # --- date range + quick buttons (ordered) ---
     min_date, max_date = df["Date"].min(), df["Date"].max()
-    d1, d2 = st.date_input(
+
+    # One canonical state tuple for this picker
+    if "dc_date_range" not in st.session_state or st.session_state.dc_date_range is None:
+        st.session_state.dc_date_range = (max_date, max_date)
+
+    def clamp(d: date) -> date:
+        return max(min(d, max_date), min_date)
+
+    def set_range(start: date, end: date):
+        # Set BEFORE rendering the date_input to avoid Streamlit state error
+        st.session_state.dc_date_range = (clamp(start), clamp(end))
+        _rerun()
+
+    # Row 1: Today, Yesterday, This Week
+    r1c1, r1c2, r1c3 = st.columns(3)
+    if r1c1.button("Today", key="dc_btn_today", use_container_width=True):
+        t = date.today()
+        set_range(t, t)
+
+    if r1c2.button("Yesterday", key="dc_btn_yesterday", use_container_width=True):
+        y = date.today() - timedelta(days=1)
+        set_range(y, y)
+
+    if r1c3.button("This Week", key="dc_btn_this_week", use_container_width=True):
+        d0 = date.today()
+        start = d0 - timedelta(days=d0.weekday())
+        set_range(start, d0)
+
+    # Row 2: Last Week, This Month, Last Month, YTD
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    if r2c1.button("Last Week", key="dc_btn_last_week", use_container_width=True):
+        d0 = date.today()
+        this_mon = d0 - timedelta(days=d0.weekday())
+        last_mon = this_mon - timedelta(days=7)
+        last_sun = last_mon + timedelta(days=6)
+        set_range(last_mon, last_sun)
+
+    if r2c2.button("This Month", key="dc_btn_this_month", use_container_width=True):
+        d0 = date.today()
+        set_range(d0.replace(day=1), d0)
+
+    if r2c3.button("Last Month", key="dc_btn_last_month", use_container_width=True):
+        d0 = date.today()
+        first_this = d0.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        set_range(last_prev.replace(day=1), last_prev)
+
+    if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
+        d0 = date.today()
+        set_range(date(d0.year, 1, 1), d0)
+
+    # Now render the date picker AFTER buttons may have updated the state
+    start, end = st.session_state.dc_date_range
+    st.session_state.dc_date_range = (clamp(start), clamp(end))  # clamp to available data
+    picked = st.date_input(
         "Date range",
-        value=(max_date, max_date),
-        min_value=min_date, max_value=max_date,
-        key="dc_date_range"
+        value=st.session_state.dc_date_range,
+        min_value=min_date,
+        max_value=max_date,
+        key="dc_date_range",
     )
-    if isinstance(d1, (tuple, list)):
-        d1, d2 = d1
 
+    # Normalize picked value
+    if isinstance(picked, (tuple, list)):
+        d1, d2 = picked
+    else:
+        d1, d2 = st.session_state.dc_date_range
+
+    # ---- FILTER (this defines `view`) ----
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
-    users_in_view = view["User"].dropna().unique().tolist()
 
-    preferred_user_order = ["Chad","Kelly"]
+    # ---- CARDS ----
+    users_in_view = view["User"].dropna().unique().tolist()
+    preferred_user_order = ["Chad", "Kelly"]
     ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
                     [u for u in sorted(users_in_view) if u not in preferred_user_order]
 
@@ -118,12 +182,13 @@ def daily_compare_tab():
         with c:
             render_daily_card(user, view[view["User"] == user])
 
+    # ---- TABLE ----
     st.divider()
     stats = (
-        view.groupby(["User","Strategy"])
-            .agg(Premium=("TotalPremium","sum"),
-                 PnL=("ProfitLoss","sum"))
-            .assign(Pct=lambda x: (x["PnL"]/x["Premium"]*100))
+        view.groupby(["User", "Strategy"], dropna=False)
+            .agg(Premium=("TotalPremium", "sum"),
+                 PnL=("ProfitLoss", "sum"))
+            .assign(Pct=lambda x: np.where(x["Premium"] != 0, (x["PnL"] / x["Premium"]) * 100, np.nan))
             .reset_index()
     )
     st.subheader("Strategy breakdown (selected range)")

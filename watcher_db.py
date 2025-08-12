@@ -36,7 +36,7 @@ ACCOUNTS_INCLUDE = []      # [] or None -> ALL accounts; else list exact Account
 ACCOUNTS_EXCLUDE = ["IB:U2604407", "IB:U16631465"]      # optional: accounts to exclude (ignored if INCLUDE is non-empty)
 
 # Only read recent rows (set to 0/None for ALL)
-DAYS_BACK      = 1
+DAYS_BACK      = 7
 
 # Scan interval
 POLL_SECONDS   = 15
