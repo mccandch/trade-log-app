@@ -338,6 +338,15 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go["getRowStyle"] = row_style
     go["headerHeight"] = 32
 
+    go["suppressSizeToFit"] = True
+    go["onFirstDataRendered"] = JsCode("""
+    function(params){
+    const all = params.columnApi.getAllDisplayedColumns();
+    // Size each column just wider than its content + header
+    params.columnApi.autoSizeColumns(all, false);
+    }
+    """)
+
     # remember selection between reruns
     sel_key = f"dc_sel_{user}"
     _prev = st.session_state.get(sel_key, [])
