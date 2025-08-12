@@ -1,216 +1,234 @@
-#!/usr/bin/env python3
-"""
-Watcher (DB → Google Sheets) — per-user tab + account filter + skip-if-unchanged
-- Reads local SQLite: data.db3 (read-only)
-- Publishes sanitized rows to Google Sheets
-- One tab per user: Raw_<USER_NAME>  (e.g., Raw_Chad)
-- Idempotent per (User, Day): FileName = "db-YYYY-MM-DD"
-- Keeps full timestamp in DateTime; Date is date-only for filters
-- Account filtering:
-    * By default exports ALL accounts
-    * To restrict, set ACCOUNTS_INCLUDE = ["acctA","acctB"]
-    * Or exclude a set with ACCOUNTS_EXCLUDE = ["acctX", ...]
-"""
+# watcher_db.py - Google Sheets sync from trading SQLite DB, including Right/Strike
+# Run:  python watcher_db.py
 
 import os
 import time
-import hashlib
 import sqlite3
-from datetime import datetime, timedelta
-import pandas as pd
+from datetime import datetime
+from typing import List, Tuple, Optional
 
+import pandas as pd
 import gspread
-from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from google.oauth2.service_account import Credentials
 
 # ================== CONFIG ==================
-USER_NAME      = "Chad"   # Change to "Kelly" on Kelly's machine
-DB_PATH        = r"C:\Users\Administrator\AppData\Local\Packages\TradeAutomationToolbox_f46cr67q31chc\LocalState\data.db3"
-
-GOOGLE_SA_JSON = r"C:\Users\Administrator\AppData\Local\Packages\TradeAutomationToolbox_f46cr67q31chc\LocalState\service_account.json"
-SHEET_NAME     = "TradeLog"
-TAB_NAME       = None      # None -> use Raw_<USER_NAME>; or set a fixed name if you prefer
-
-# Accounts filtering
-ACCOUNTS_INCLUDE = []      # [] or None -> ALL accounts; else list exact Account values to include
-ACCOUNTS_EXCLUDE = ["IB:U2604407", "IB:U16631465"]      # optional: accounts to exclude (ignored if INCLUDE is non-empty)
-
-# Only read recent rows (set to 0/None for ALL)
-DAYS_BACK      = 7
-
-# Scan interval
-POLL_SECONDS   = 15
+DB_PATH = r"C:\Users\Administrator\AppData\Local\Packages\TradeAutomationToolbox_f46cr67q31chc\LocalState\data.db3"  # <-- CHANGE if needed
+GOOGLE_SA_JSON = r"C:\Users\Administrator\AppData\Local\Packages\TradeAutomationToolbox_f46cr67q31chc\LocalState\service_account.json"  # <-- CHANGE
+SHEET_NAME = "TradeLog"                 # Google Sheet file name
+TAB_PREFIX = "Raw_"                     # tab will be f"{TAB_PREFIX}{USER_NAME}"
+USER_NAME = "Chad"                      # <-- CHANGE per machine
+POLL_SECONDS = 20                       # how often to re-scan
+LOOKBACK_DAYS = 60                      # how many days back to pull
+# Accounts filter (optional). If INCLUDE is non-empty, only those are synced.
+ACCOUNTS_INCLUDE: List[str] = []
+ACCOUNTS_EXCLUDE: List[str] = []
 # ============================================
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
 
-BASE_COLS = ["User","Date","DateTime","FileName","BatchId","Strategy","TotalPremium","ProfitLoss"]
+def ticks_to_dt_utc(ticks: int) -> Optional[datetime]:
+    """
+    Convert .NET ticks to UTC datetime (naive).
+    .NET ticks: 100ns intervals since 0001-01-01.
+    Unix epoch ticks = 621355968000000000
+    """
+    if ticks is None:
+        return None
+    try:
+        sec = (int(ticks) - 621355968000000000) / 10_000_000
+        return datetime.utcfromtimestamp(sec)
+    except Exception:
+        return None
 
-def tab_name():
-    return TAB_NAME or f"Raw_{USER_NAME}"
 
-def open_ws():
-    creds = Credentials.from_service_account_file(GOOGLE_SA_JSON, scopes=SCOPES)
+def normalize_right(val):
+    """Map various encodings to 'C' or 'P'. Returns None if unknown."""
+    if val is None:
+        return None
+    s = str(val).strip().upper()
+    if s in {"C", "CALL", "CALLS", "1"}:
+        return "C"
+    if s in {"P", "PUT", "PUTS", "2"}:
+        return "P"
+    if s.isdigit():
+        return "C" if s == "1" else ("P" if s == "2" else None)
+    return None
+
+
+def pick_short_leg(cur: sqlite3.Cursor, order_id: Optional[int]) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Return (Right, Strike) for the most representative short leg from the opening order.
+    Heuristic:
+      1) Prefer legs with Qty < 0 (short).
+      2) If multiple, choose the one with largest abs(Qty).
+      3) If none are short, pick the first leg.
+    """
+    if not order_id:
+        return (None, None)
+    rows = cur.execute(
+        'SELECT PutCall, Strike, Qty FROM OrderLeg WHERE OrderID=?',
+        (order_id,)
+    ).fetchall()
+    if not rows:
+        return (None, None)
+
+    short = [r for r in rows if (r[2] is not None and float(r[2]) < 0)]
+    pick = short[0] if short else rows[0]
+    if short:
+        short.sort(key=lambda r: abs(float(r[2])), reverse=True)
+        pick = short[0]
+
+    right = normalize_right(pick[0])
+    try:
+        strike = float(pick[1]) if pick[1] is not None else None
+    except Exception:
+        strike = None
+    return (right, strike)
+
+
+def open_sheet_and_tab():
+    creds = Credentials.from_service_account_file(
+        GOOGLE_SA_JSON,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
     gc = gspread.authorize(creds)
     sh = gc.open(SHEET_NAME)
-    name = tab_name()
+
+    tab_name = f"{TAB_PREFIX}{USER_NAME}"
     try:
-        ws = sh.worksheet(name)
+        ws = sh.worksheet(tab_name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=200, cols=20)
-        set_with_dataframe(ws, pd.DataFrame(columns=BASE_COLS))
+        ws = sh.add_worksheet(title=tab_name, rows=1000, cols=20)
+        # initialize header
+        header = ["User","DateTime","Source","TradeID","Account","Strategy","Right","Strike","Premium","PnL","BatchID"]
+        ws.update("A1", [header])
     return sh, ws
 
-def ensure_base_cols(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in BASE_COLS:
-        if c not in out.columns:
-            out[c] = pd.Series(dtype="object")
-    out["DateTime"] = pd.to_datetime(out.get("DateTime"), errors="coerce")
-    out["Date"]     = pd.to_datetime(out.get("Date"), errors="coerce")
-    return out[BASE_COLS]
 
-# ----- Helpers -----
-# .NET ticks → naive UTC datetime
-def ticks_to_dt(ticks):
-    if pd.isna(ticks): return pd.NaT
+def get_existing_trade_ids(ws) -> set:
+    """Return set of existing TradeID values in the sheet (as strings)."""
     try:
-        return datetime(1,1,1) + timedelta(microseconds=int(ticks)/10)
+        records = ws.get_all_records()
+        return {str(r.get("TradeID")) for r in records if r.get("TradeID") not in (None, "")}
     except Exception:
-        return pd.NaT
+        return set()
 
-def list_accounts(db_path: str):
-    try:
-        uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        acc = pd.read_sql_query('SELECT DISTINCT Account FROM "Trade" WHERE Account IS NOT NULL ORDER BY Account;', conn)
-        conn.close()
-        return acc["Account"].dropna().astype(str).tolist()
-    except Exception:
-        return []
 
-def read_from_sqlite(db_path: str, days_back=None) -> pd.DataFrame:
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-
-    base_q = '''
-      SELECT Account, Strategy, TotalPremium, ProfitLoss, DateOpened
-      FROM "Trade"
-      WHERE Strategy IS NOT NULL
-    '''
-    params = []
-    q = base_q
-
-    # Account include/exclude
+def accounts_ok(acct: Optional[str]) -> bool:
+    if acct is None:
+        return True
     if ACCOUNTS_INCLUDE:
-        placeholders = ",".join(["?"] * len(ACCOUNTS_INCLUDE))
-        q += f" AND Account IN ({placeholders})"
-        params.extend(ACCOUNTS_INCLUDE)
-    elif ACCOUNTS_EXCLUDE:
-        placeholders = ",".join(["?"] * len(ACCOUNTS_EXCLUDE))
-        q += f" AND Account NOT IN ({placeholders})"
-        params.extend(ACCOUNTS_EXCLUDE)
+        return acct in ACCOUNTS_INCLUDE
+    if ACCOUNTS_EXCLUDE:
+        return acct not in ACCOUNTS_EXCLUDE
+    return True
 
-    df = pd.read_sql_query(q, conn, params=params)
-    conn.close()
 
-    # All rows in this watcher belong to USER_NAME
-    df["User"] = USER_NAME
+def pull_trades_df(con: sqlite3.Connection) -> pd.DataFrame:
+    """
+    Pull recent trades and build a dataframe with the columns we need.
+    """
+    cur = con.cursor()
+    q = """
+    SELECT TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen
+    FROM Trade
+    WHERE DateOpened >= ?
+    ORDER BY TradeID ASC
+    """
+    now_utc = datetime.utcnow()
+    cutoff_dt = now_utc - pd.Timedelta(days=LOOKBACK_DAYS)
+    cutoff_ticks = 621355968000000000 + int(cutoff_dt.timestamp() * 10_000_000)
 
-    # Time fields
-    dt = df["DateOpened"].apply(ticks_to_dt)
-    df["DateTime"] = pd.to_datetime(dt)
-    df["Date"]     = df["DateTime"].dt.normalize()
+    rows = cur.execute(q, (cutoff_ticks,)).fetchall()
 
-    # Clean fields
-    df["Strategy"]     = df["Strategy"].astype(str).str.strip()
-    df["TotalPremium"] = pd.to_numeric(df["TotalPremium"], errors="coerce").fillna(0.0)
-    df["ProfitLoss"]   = pd.to_numeric(df["ProfitLoss"],  errors="coerce").fillna(0.0)
+    items = []
+    src = os.path.basename(DB_PATH)
 
-    # Optional lookback
-    if days_back and days_back > 0:
-        cutoff = (pd.Timestamp.utcnow() - pd.Timedelta(days=days_back)).tz_localize(None)
-        df = df[df["DateTime"] >= cutoff]
+    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen in rows:
+        if not accounts_ok(Account):
+            continue
 
-    return df[["User","Date","DateTime","Strategy","TotalPremium","ProfitLoss"]].copy()
+        dt = ticks_to_dt_utc(DateOpened)
+        right, strike = pick_short_leg(cur, OrderIDOpen)
 
-def day_batch_id(day_df: pd.DataFrame) -> str:
-    h = hashlib.md5()
-    for row in day_df[["DateTime","Strategy","TotalPremium","ProfitLoss"]].astype(str).itertuples(index=False):
-        h.update("|".join(row).encode("utf-8"))
-    return h.hexdigest()
+        # Batch by calendar date (helps if you want to track/replace per-day later)
+        batch_id = f"db-{USER_NAME}-{dt.date().isoformat()}" if dt else None
 
-def replace_day(ws, df_current: pd.DataFrame, user: str, day_ts: pd.Timestamp, day_df: pd.DataFrame) -> pd.DataFrame:
-    df_current = ensure_base_cols(df_current)
+        items.append({
+            "User": USER_NAME,
+            "DateTime": dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "",
+            "Source": src,
+            "TradeID": TradeID,
+            "Account": Account,
+            "Strategy": Strategy or "",
+            "Right": right or "",
+            "Strike": strike,
+            "Premium": float(TotalPremium) if TotalPremium is not None else None,
+            "PnL": float(ProfitLoss) if ProfitLoss is not None else None,
+            "BatchID": batch_id,
+        })
 
-    file_name = f"db-{day_ts.date().isoformat()}"
-    batch_id  = day_batch_id(day_df)
+    return pd.DataFrame(items)
 
-    # ---------- OPTIMIZATION: skip write if BatchId already matches ----------
-    existing_subset = df_current[(df_current["User"] == user) & (df_current["FileName"] == file_name)]
-    if not existing_subset.empty:
-        existing_ids = existing_subset["BatchId"].dropna().unique().tolist()
-        if len(existing_ids) == 1 and existing_ids[0] == batch_id:
-            print(f"No changes for {user} {file_name}; skipping write.")
-            return df_current
-    # ------------------------------------------------------------------------
 
-    # Remove only this (User, FileName) then append new rows
-    keep = ~((df_current["User"] == user) & (df_current["FileName"] == file_name))
-    df_current = df_current.loc[keep].copy()
-
-    new_rows = day_df.copy()
-    new_rows["User"]     = user
-    new_rows["FileName"] = file_name
-    new_rows["BatchId"]  = batch_id
-    new_rows = ensure_base_cols(new_rows)
-
-    final = pd.concat([df_current, new_rows], ignore_index=True)
-    set_with_dataframe(ws, final, include_index=False)
-    return final
-
-def scan_and_sync():
-    if not os.path.exists(DB_PATH):
-        print(f"DB not found: {DB_PATH}")
-        return
-
-    _, ws = open_ws()
-
-    # One-time: list accounts so you know what to put in ACCOUNTS_INCLUDE
-    accs = list_accounts(DB_PATH)
-    if accs:
-        print(f"Available accounts in DB: {', '.join(accs)}")
-
-    df_existing = get_as_dataframe(ws, evaluate_formulas=True, dtype={"Date": str}).dropna(how="all")
-    if df_existing.empty:
-        df_existing = pd.DataFrame(columns=BASE_COLS)
-    else:
-        df_existing["Date"]     = pd.to_datetime(df_existing.get("Date"), errors="coerce")
-        df_existing["DateTime"] = pd.to_datetime(df_existing.get("DateTime"), errors="coerce")
-        df_existing["User"]     = df_existing.get("User","").astype(str).str.strip()
-        df_existing["Strategy"] = df_existing.get("Strategy","").astype(str).str.strip()
-
-    df = read_from_sqlite(DB_PATH, days_back=DAYS_BACK)
+def append_new_rows(ws, df: pd.DataFrame):
+    """
+    Append rows that have not yet been written (by TradeID).
+    If the header row is missing new columns, we ensure it's present.
+    """
     if df.empty:
-        print("No rows found in DB for the selected window.")
+        print("No rows found in DB for the lookback window.")
         return
 
-    for day, day_df in df.groupby("Date"):
+    header = ["User","DateTime","Source","TradeID","Account","Strategy","Right","Strike","Premium","PnL","BatchID"]
+    try:
+        first_row = ws.row_values(1)
+    except Exception:
+        first_row = []
+    if [h.strip() for h in first_row] != header:
+        ws.update("A1", [header])  # rewrite header if needed
+
+    existing_ids = get_existing_trade_ids(ws)
+    new_df = df[~df["TradeID"].astype(str).isin(existing_ids)].copy()
+
+    if new_df.empty:
+        print("No new trades to append (all TradeIDs already exist).")
+        return
+
+    new_df = new_df.fillna("")
+    values = new_df[header].values.tolist()
+
+    CHUNK = 500
+    for start in range(0, len(values), CHUNK):
+        ws.append_rows(values[start:start+CHUNK], value_input_option="USER_ENTERED", table_range="A1")
+
+    print(f"Appended {len(new_df)} new rows.")
+
+
+def run_once():
+    try:
+        if not os.path.exists(DB_PATH):
+            print(f"DB not found: {DB_PATH}")
+            return
+        _, ws = open_sheet_and_tab()
+        con = sqlite3.connect(DB_PATH)
         try:
-            df_existing = replace_day(ws, df_existing, USER_NAME, pd.to_datetime(day), day_df)
-            print(f"Synced {USER_NAME} {day}: {len(day_df)} rows")
-        except Exception as e:
-            print(f"Skipping {day}: {e}")
+            df = pull_trades_df(con)
+        finally:
+            con.close()
+        append_new_rows(ws, df)
+    except Exception as e:
+        print("Scan error:", e)
+
 
 def main():
-    print(f"Starting DB watcher for {USER_NAME} → tab '{tab_name()}' ... Ctrl+C to stop.")
+    print(f"Starting DB watcher for {USER_NAME} -> tab '{TAB_PREFIX}{USER_NAME}'. Ctrl+C to stop.")
     while True:
-        try:
-            scan_and_sync()
-        except Exception as e:
-            print("Scan error:", e)
+        run_once()
         time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()

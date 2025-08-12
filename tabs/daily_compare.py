@@ -28,39 +28,17 @@ def _inject_dc_compact_css():
     </style>
     """, unsafe_allow_html=True)
 
-def _inject_dc_css():
-    if st.session_state.get("_dc_css_done"):
-        return
-    st.session_state["_dc_css_done"] = True
+def _numeric_series(df: pd.DataFrame, candidates, default=0.0) -> pd.Series:
+    """
+    Return a numeric Series from the first column in `candidates` that exists.
+    If none exist, return a Series full of `default` with the same index.
+    """
+    for c in candidates:
+        if c in df.columns:
+            return pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    # fallback: Series of defaults, same index
+    return pd.Series(default, index=df.index, dtype="float64")
 
-    st.markdown("""
-    <style>
-      /* Keep things compact */
-      .dc-card .element-container{ margin-bottom: 2px !important; }
-      .dc-card [data-testid="stMarkdownContainer"] p{ margin:0 !important; }
-
-      /* Strategy | PCR laid out as two columns with a visible gap */
-      .dc-card .dc-row{
-        display: grid;
-        grid-template-columns: 1fr 6rem;   /* left flexes, right is fixed width */
-        column-gap: .75rem;                /* <-- visible spacing between columns */
-        align-items: center;
-        min-height: 28px;                  /* match checkbox height */
-        margin: 2px 0;
-      }
-      .dc-card .dc-strat{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .dc-card .dc-pcr{ text-align: right; white-space: nowrap; }
-
-      /* Checkbox vertical alignment */
-      .dc-card [data-testid="stCheckbox"]{ margin:0 !important; }
-      .dc-card [data-testid="stCheckbox"] > div{
-        display:flex; align-items:center; min-height:28px;
-      }
-      .dc-card [data-testid="stCheckbox"] div[role="checkbox"]{
-        transform: translateY(-2px);   /* nudge up; increase to -3px if needed */
-      }
-    </style>
-    """, unsafe_allow_html=True)
 
 # ---------- small utility ----------
 
@@ -87,109 +65,92 @@ def open_sheet():
     return gc.open(st.secrets["sheets"]["sheet_name"])
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60)
 def load_sheets_data() -> pd.DataFrame:
-    """
-    Read all tabs that start with Raw_* and normalize to columns:
-    User, Date (date), DateTime (datetime), Strategy, TotalPremium, ProfitLoss.
-
-    Time parsing is robust to:
-      - Google Sheets time fractions (0..1 of a day)
-      - "HH:MM[:SS]" / "h:mm AM/PM" strings
-      - integer minutes since midnight (0..1440)
-      - HHMM integers (e.g., 931 -> 09:31)
-    """
+    """Read Raw_* tabs and normalize columns for the app."""
     sh = open_sheet()
-    frames: List[pd.DataFrame] = []
+    frames = []
+
+    # helper to normalize common column names
+    def _rename_cols(df: pd.DataFrame) -> pd.DataFrame:
+        rename_map = {}
+        for c in list(df.columns):
+            k = str(c).strip()
+            if k in ("ProfitLoss", "P/L", "PL"):
+                rename_map[c] = "PnL"
+            elif k in ("TotalPremium", "Total Premium", "Premium($)"):
+                rename_map[c] = "Premium"
+            elif k in ("SourceFile", "Source file"):
+                rename_map[c] = "Source"
+            # keep existing names for: User, DateTime, Strategy, Right, Strike, BatchID, TradeID, Account
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        return df
 
     for ws in sh.worksheets():
-        if not ws.title.startswith("Raw_"):
+        title = ws.title or ""
+        if not title.startswith("Raw_"):
             continue
 
         df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how="all")
         if df.empty:
             continue
 
-        out = pd.DataFrame()
+        df = _rename_cols(df)
 
-        # --- User ---
-        if "User" in df.columns and df["User"].notna().any():
-            out["User"] = df["User"]
-        else:
-            out["User"] = ws.title.replace("Raw_", "")  # fallback from sheet name
+        # Ensure we have a User value; if missing, derive from tab name (Raw_<user>)
+        if "User" not in df.columns or df["User"].isna().all():
+            df["User"] = title.replace("Raw_", "", 1)
 
-        # --- Date (date only) ---
-        out["Date"] = pd.to_datetime(df.get("Date"), errors="coerce").dt.date
-
-        # --- DateTime (default = date at midnight) ---
-        out["DateTime"] = pd.to_datetime(out["Date"], errors="coerce")
-
-        # Prefer an existing DateTime column if present
+        # Build a single DateTime from whatever we have
         if "DateTime" in df.columns:
             dt = pd.to_datetime(df["DateTime"], errors="coerce")
-            mask = dt.notna()
-            out.loc[mask, "DateTime"] = dt[mask]
+        elif "Date" in df.columns:
+            dt = pd.to_datetime(df["Date"], errors="coerce")
         else:
-            # Try to find a time-of-day column
-            time_col = next(
-                (c for c in ("EntryTime", "Time", "TimeOpened", "Time Opened", "Entry Time") if c in df.columns),
-                None,
+            # create an all-NaT series of correct length
+            dt = pd.to_datetime(pd.Series([pd.NaT] * len(df)), errors="coerce")
+
+        df["DateTime"] = dt
+        df["Date"] = dt.dt.date
+
+        # Numeric fields
+        for col in ("Premium", "PnL", "Strike"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Normalize Right a bit (C/P/Call/Put)
+        if "Right" in df.columns:
+            ser = df["Right"].astype(str).str.strip().str.upper()
+            df["Right"] = (
+                ser.replace({"CALL": "C", "CALLS": "C", "PUT": "P", "PUTS": "P", "1": "C", "2": "P"})
             )
-            if time_col is not None:
-                tser = df[time_col]
+        else:
+            df["Right"] = pd.NA
 
-                def to_seconds(v):
-                    if pd.isna(v):
-                        return np.nan
-                    if isinstance(v, pd.Timestamp):
-                        return v.hour * 3600 + v.minute * 60 + v.second
-                    if isinstance(v, (int, float, np.number)):
-                        f = float(v)
-                        if 0 <= f <= 1:            # fraction of a day
-                            return int(round(f * 86400))
-                        if 0 <= f < 1440:          # minutes since midnight
-                            return int(round(f)) * 60
-                        n = int(round(f))
-                        if 0 <= n < 2400:          # HHMM
-                            h, m = divmod(n, 100)
-                            return h * 3600 + m * 60
-                        return np.nan
-                    if isinstance(v, str):
-                        s = v.strip()
-                        if not s:
-                            return np.nan
-                        try:
-                            tt = pd.to_datetime("1970-01-01 " + s, errors="raise")
-                            return int(tt.hour * 3600 + tt.minute * 60 + tt.second)
-                        except Exception:
-                            if s.isdigit():
-                                n = int(s)
-                                if 0 <= n < 1440:
-                                    return n * 60
-                                if 0 <= n < 2400:
-                                    h, m = divmod(n, 100)
-                                    return h * 3600 + m * 60
-                            return np.nan
-                    return np.nan
+        # Keep only the columns the app needs (others pass-through if present)
+        keep = [
+            "User", "Date", "DateTime", "Strategy", "Right", "Strike",
+            "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
+        ]
+        # add any that exist
+        cols = [c for c in keep if c in df.columns]
+        out = df[cols].copy()
 
-                secs = tser.apply(to_seconds)
-                mask = secs.notna()
-                if mask.any():
-                    base_dates = pd.to_datetime(out.loc[mask, "Date"], errors="coerce")
-                    out.loc[mask, "DateTime"] = base_dates + pd.to_timedelta(secs[mask], unit="s")
-
-        # --- Strategy / Premium / PnL ---
-        out["Strategy"] = df.get("Strategy").astype(str)
-        out["TotalPremium"] = pd.to_numeric(df.get("TotalPremium"), errors="coerce").fillna(0.0)
-        out["ProfitLoss"] = pd.to_numeric(df.get("ProfitLoss"), errors="coerce").fillna(0.0)
-
+        # tag the source tab (useful for debugging)
+        out["__source_tab"] = title
         frames.append(out)
 
     if not frames:
-        return pd.DataFrame(columns=["User", "Date", "DateTime", "Strategy", "TotalPremium", "ProfitLoss"])
+        return pd.DataFrame(
+            columns=["User","Date","DateTime","Strategy","Right","Strike","Premium","PnL","Source","BatchID","TradeID","Account","__source_tab"]
+        )
 
     all_df = pd.concat(frames, ignore_index=True)
-    all_df = all_df[all_df["Date"].notna()].reset_index(drop=True)
+
+    # Drop rows with no strategy or completely NaT datetime if you like:
+    # all_df = all_df[all_df["Strategy"].notna()]
+
     return all_df
 
 
@@ -221,72 +182,76 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     """Return Strategy + PCR% for a single user's filtered window."""
     if df_user.empty:
         return pd.DataFrame(columns=["Strategy", "PCR"])
+
+    dfu = df_user.copy()
+    # Canonicalize numeric columns (accept both old and new names)
+    dfu["Premium"] = _numeric_series(dfu, ["Premium", "TotalPremium", "Premium($)"])
+    dfu["PnL"]     = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
+
     g = (
-        df_user.groupby("Strategy", dropna=False)
-        .agg(Premium=("TotalPremium", "sum"), PnL=("ProfitLoss", "sum"))
-        .reset_index()
+        dfu.groupby("Strategy", dropna=False)[["Premium", "PnL"]]
+           .sum()
+           .reset_index()
     )
-    g["PCR"] = g.apply(lambda r: _pcr(r["PnL"], r["Premium"]), axis=1)
+    g["PCR"] = np.where(g["Premium"] != 0, (g["PnL"] / g["Premium"]) * 100.0, 0.0)
     g["Strategy"] = g["Strategy"].astype(str)
     g = g.sort_values("Strategy", key=lambda s: s.map(_order_key))
     return g[["Strategy", "PCR"]]
 
-def render_trades_table(trades_df: pd.DataFrame, *, title: str):
-    """Pretty table: Entry time | Strategy | PnL ($), green for wins & red for losses."""
-    if trades_df.empty:
-        st.info(f"No trades for {title.lower()}.")
+def render_trades_table(trades: pd.DataFrame, title: str):
+    if trades.empty:
+        st.caption(f"{title}: no trades")
         return
 
-    # prefer a datetime-like column if present
-    dt_col = "DateTime" if "DateTime" in trades_df.columns else "Date"
-    show = (
-        trades_df.rename(columns={dt_col: "Entry time", "ProfitLoss": "PnL"})
-        .loc[:, ["Entry time", "Strategy", "PnL"]]
-        .sort_values("Entry time")
-        .copy()
-    )
-    # Optional: trim seconds
-    try:
-        show["Entry time"] = pd.to_datetime(show["Entry time"]).dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        pass
+    # Keep columns if present
+    cols = []
+    # Entry time
+    if "DateTime" in trades.columns:
+        trades = trades.copy()
+        trades["Entry time"] = pd.to_datetime(trades["DateTime"], errors="coerce")
+        cols.append("Entry time")
 
-    # format + color rows
-    styler = show.style.format({"PnL": "${:,.2f}"})
-    # Hide index across pandas versions
-    try:
-        styler = styler.hide(axis="index")           # pandas >= 1.4
-    except Exception:
+    # New columns from watcher
+    if "Right" in trades.columns:
+        cols.append("Right")
+    if "Strike" in trades.columns:
+        # pretty-up integers like 505.0 -> 505
+        trades["Strike"] = trades["Strike"].apply(lambda x: int(x) if pd.notna(x) and float(x).is_integer() else x)
+        cols.append("Strike")
+
+    # Existing columns
+    cols += [c for c in ["Strategy"] if c in trades.columns]
+    if "PnL" in trades.columns:
+        trades["PnL"] = trades["PnL"].astype(float)
+        cols.append("PnL")
+
+    view = trades[cols].sort_values(by="Entry time", ascending=True, na_position="last")
+
+    # Row coloring by PnL
+    def _row_style(row):
         try:
-            styler = styler.hide_index()             # older pandas
+            val = float(row.get("PnL", 0))
         except Exception:
-            styler = styler.set_table_styles([
-                {"selector": "th.row_heading", "props": "display: none;"},
-                {"selector": "th.blank",        "props": "display: none;"},
-            ], overwrite=False)
+            val = 0
+        color = "#143d2b" if val > 0 else ("#4b1f1f" if val < 0 else "transparent")
+        return [f"background-color: {color}"] * len(row)
 
-    def _row_color(row):
-        try:
-            v = float(row["PnL"])
-        except Exception:
-            return [""] * len(row)
-        if v > 0:
-            bg = "rgba(0, 128, 0, 0.18)"   # medium green
-        elif v < 0:
-            bg = "rgba(200, 0, 0, 0.20)"   # medium red
-        else:
-            bg = ""
-        return [f"background-color: {bg};"] * len(row)
+    styled = view.style.apply(_row_style, axis=1)\
+                       .format({"Entry time": "{:%Y-%m-%d %H:%M}",
+                                "PnL": "${:,.2f}"})\
+                       .set_table_attributes('class="compact-table"')\
+                       .hide(axis="index")
 
-    styler = styler.apply(_row_color, axis=1)
-    st.markdown(f"##### {title}")
-    st.markdown(styler.set_table_attributes('class="compact-table"').to_html(),
-                unsafe_allow_html=True)
+    st.dataframe(styled, use_container_width=True)
 
 def render_user_card_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
     # overall
-    prem_sum = float(pd.to_numeric(df_user.get("TotalPremium", 0), errors="coerce").sum())
-    pnl_sum  = float(pd.to_numeric(df_user.get("ProfitLoss", 0), errors="coerce").sum())
+    # Accept both new and old column names
+    prem_series = _numeric_series(df_user, ["Premium", "TotalPremium", "Premium($)"])
+    pnl_series  = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
+
+    prem_sum = float(prem_series.sum())
+    pnl_sum  = float(pnl_series.sum())
     overall  = _pcr(pnl_sum, prem_sum)
 
     st.markdown(f"### {user}")
@@ -427,10 +392,15 @@ def daily_compare_tab():
 
     # ---- Global Strategy breakdown (selected range) ----
     st.divider()
+
+    df_view = view.copy()
+    df_view["Premium"] = _numeric_series(df_view, ["Premium", "TotalPremium", "Premium($)"])
+    df_view["PnL"]     = _numeric_series(df_view, ["PnL", "ProfitLoss", "P/L", "PL"])
+
     stats = (
-        view.groupby(["User", "Strategy"], dropna=False)
-        .agg(Premium=("TotalPremium", "sum"), PnL=("ProfitLoss", "sum"))
-        .reset_index()
+        df_view.groupby(["User", "Strategy"], dropna=False)[["Premium", "PnL"]]
+            .sum()
+            .reset_index()
     )
     stats["PCR %"] = np.where(stats["Premium"] != 0, (stats["PnL"] / stats["Premium"]) * 100.0, np.nan)
     stats = stats[["User", "Strategy", "PCR %", "Premium", "PnL"]]
