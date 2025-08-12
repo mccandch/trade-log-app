@@ -1,5 +1,4 @@
 # tabs/daily_compare.py
-
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -9,25 +8,64 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
 import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 
-def _inject_dc_compact_css():
-    if st.session_state.get("_dc_compact_css_done"):
-        return
-    st.session_state["_dc_compact_css_done"] = True
-    st.markdown("""
-    <style>
-      /* Scope to our rows wrapper so it won't leak elsewhere */
-      .dc-rows div[data-testid="stCheckbox"] { margin: 0 !important; }
-      .dc-rows label[data-testid="stWidgetLabel"] { margin: 0 !important; padding: 0 !important; }
-      .dc-rows [data-testid="stHorizontalBlock"] { gap: .55rem !important; } /* small col gap */
-      .dc-rows .stColumn > div { margin: 0 !important; padding-top: 0 !important; padding-bottom: 0 !important; }
-      .dc-pct { display:block; text-align:right; width:6.5rem; font-variant-numeric: tabular-nums; }
-    </style>
-    """, unsafe_allow_html=True)
 
+# =========================
+# CSS helpers (runtime only)
+# =========================
+def _aggrid_css() -> None:
+    """Inject CSS for centered headers and tight spacing. Call at the start of the tab."""
+    st.markdown(
+        """
+        <style>
+          /* Center headers for any AG Grid theme */
+          [class^="ag-theme"] .ag-header-cell-label { display:flex; justify-content:center; }
+          [class^="ag-theme"] .ag-header-cell-text  { margin-left: 0 !important; }
+
+          /* Optional header class applied via headerClass="dc-center" */
+          .dc-center .ag-header-cell-label { justify-content: center; }
+          .dc-center .ag-header-cell-text  { margin-left: 0 !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _user_header(name: str, overall: float) -> None:
+    """Render 'Name  [+/-X.X% overall]' tightly above the grid."""
+    if overall > 0:
+        color, bg = "#22c55e", "rgba(34,197,94,0.12)"   # green
+    elif overall < 0:
+        color, bg = "#ef4444", "rgba(239,68,68,0.12)"   # red
+    else:
+        color, bg = "#9ca3af", "rgba(148,163,184,0.12)" # gray
+
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;gap:12px;margin:0 0 4px 0;">
+          <span style="font-size:28px;font-weight:900;color:#e5e7eb !important;line-height:1;">
+            {name}
+          </span>
+          <span style="
+            display:inline-block;padding:4px 10px;border-radius:12px;
+            font-weight:800;font-size:20px;line-height:1;
+            color:{color} !important;background:{bg};
+            border:1px solid rgba(255,255,255,0.06);
+          ">{overall:+.1f}% overall</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =================
+# Utility functions
+# =================
 def _numeric_series(df: pd.DataFrame, candidates, default=0.0) -> pd.Series:
     """
     Return a numeric Series from the first column in `candidates` that exists.
@@ -36,11 +74,8 @@ def _numeric_series(df: pd.DataFrame, candidates, default=0.0) -> pd.Series:
     for c in candidates:
         if c in df.columns:
             return pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    # fallback: Series of defaults, same index
     return pd.Series(default, index=df.index, dtype="float64")
 
-
-# ---------- small utility ----------
 
 def _rerun():
     try:
@@ -49,8 +84,9 @@ def _rerun():
         st.rerun()
 
 
-# ---------- Google Sheets I/O ----------
-
+# ========================
+# Google Sheets I/O loader
+# ========================
 def open_sheet():
     """Authorize and open the Google Sheet specified in secrets."""
     sa_info = dict(st.secrets["gcp_service_account"])
@@ -71,7 +107,6 @@ def load_sheets_data() -> pd.DataFrame:
     sh = open_sheet()
     frames = []
 
-    # helper to normalize common column names
     def _rename_cols(df: pd.DataFrame) -> pd.DataFrame:
         rename_map = {}
         for c in list(df.columns):
@@ -82,10 +117,7 @@ def load_sheets_data() -> pd.DataFrame:
                 rename_map[c] = "Premium"
             elif k in ("SourceFile", "Source file"):
                 rename_map[c] = "Source"
-            # keep existing names for: User, DateTime, Strategy, Right, Strike, BatchID, TradeID, Account
-        if rename_map:
-            df = df.rename(columns=rename_map)
-        return df
+        return df.rename(columns=rename_map) if rename_map else df
 
     for ws in sh.worksheets():
         title = ws.title or ""
@@ -108,7 +140,6 @@ def load_sheets_data() -> pd.DataFrame:
         elif "Date" in df.columns:
             dt = pd.to_datetime(df["Date"], errors="coerce")
         else:
-            # create an all-NaT series of correct length
             dt = pd.to_datetime(pd.Series([pd.NaT] * len(df)), errors="coerce")
 
         df["DateTime"] = dt
@@ -119,43 +150,40 @@ def load_sheets_data() -> pd.DataFrame:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Normalize Right a bit (C/P/Call/Put)
+        # Normalize Right (C/P/Call/Put variants)
         if "Right" in df.columns:
             ser = df["Right"].astype(str).str.strip().str.upper()
-            df["Right"] = (
-                ser.replace({"CALL": "C", "CALLS": "C", "PUT": "P", "PUTS": "P", "1": "C", "2": "P"})
+            df["Right"] = ser.replace(
+                {"CALL": "C", "CALLS": "C", "PUT": "P", "PUTS": "P", "1": "C", "2": "P"}
             )
         else:
             df["Right"] = pd.NA
 
-        # Keep only the columns the app needs (others pass-through if present)
         keep = [
             "User", "Date", "DateTime", "Strategy", "Right", "Strike",
             "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
         ]
-        # add any that exist
         cols = [c for c in keep if c in df.columns]
         out = df[cols].copy()
 
-        # tag the source tab (useful for debugging)
-        out["__source_tab"] = title
+        out["__source_tab"] = title  # helpful for debugging
         frames.append(out)
 
     if not frames:
         return pd.DataFrame(
-            columns=["User","Date","DateTime","Strategy","Right","Strike","Premium","PnL","Source","BatchID","TradeID","Account","__source_tab"]
+            columns=[
+                "User", "Date", "DateTime", "Strategy", "Right", "Strike",
+                "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
+                "__source_tab",
+            ]
         )
 
-    all_df = pd.concat(frames, ignore_index=True)
-
-    # Drop rows with no strategy or completely NaT datetime if you like:
-    # all_df = all_df[all_df["Strategy"].notna()]
-
-    return all_df
+    return pd.concat(frames, ignore_index=True)
 
 
-# ---------- presentation helpers ----------
-
+# ========================
+# Presentation + Computeds
+# ========================
 PREFERRED_ORDER = [
     "EMA Credit Spread", "PH", "Early Hour", "Megatrend", "EMA-T", "EMA-1x", "EMA-B"
 ]
@@ -169,14 +197,17 @@ ALIAS = {
     "EMA-B": "EMA-B",
 }
 
+
 def _order_key(name: str):
     try:
         return (0, PREFERRED_ORDER.index(name))
     except ValueError:
         return (1, name.lower())
 
+
 def _pcr(pnl_sum: float, prem_sum: float) -> float:
     return 0.0 if prem_sum == 0 else (pnl_sum / prem_sum) * 100.0
+
 
 def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     """Return Strategy + PCR% for a single user's filtered window."""
@@ -184,48 +215,49 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["Strategy", "PCR"])
 
     dfu = df_user.copy()
-    # Canonicalize numeric columns (accept both old and new names)
     dfu["Premium"] = _numeric_series(dfu, ["Premium", "TotalPremium", "Premium($)"])
-    dfu["PnL"]     = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
+    dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
 
     g = (
         dfu.groupby("Strategy", dropna=False)[["Premium", "PnL"]]
-           .sum()
-           .reset_index()
+        .sum()
+        .reset_index()
     )
     g["PCR"] = np.where(g["Premium"] != 0, (g["PnL"] / g["Premium"]) * 100.0, 0.0)
     g["Strategy"] = g["Strategy"].astype(str)
     g = g.sort_values("Strategy", key=lambda s: s.map(_order_key))
     return g[["Strategy", "PCR"]]
 
+
 def render_trades_table(trades: pd.DataFrame, title: str):
     if trades.empty:
         st.caption(f"{title}: no trades")
         return
 
-    # Keep columns if present
     cols = []
-    # Entry time
     if "DateTime" in trades.columns:
         trades = trades.copy()
         trades["Entry time"] = pd.to_datetime(trades["DateTime"], errors="coerce")
         cols.append("Entry time")
 
-    # New columns from watcher
     if "Right" in trades.columns:
         cols.append("Right")
+
     if "Strike" in trades.columns:
-        # pretty-up integers like 505.0 -> 505
-        trades["Strike"] = trades["Strike"].apply(lambda x: int(x) if pd.notna(x) and float(x).is_integer() else x)
+        trades["Strike"] = trades["Strike"].apply(
+            lambda x: int(x) if pd.notna(x) and float(x).is_integer() else x
+        )
         cols.append("Strike")
 
-    # Existing columns
     cols += [c for c in ["Strategy"] if c in trades.columns]
+
     if "PnL" in trades.columns:
-        trades["PnL"] = trades["PnL"].astype(float)
+        trades["PnL"] = pd.to_numeric(trades["PnL"], errors="coerce")
         cols.append("PnL")
 
-    view = trades[cols].sort_values(by="Entry time", ascending=True, na_position="last")
+    view = trades[cols]
+    if "Entry time" in view.columns:
+        view = view.sort_values(by="Entry time", ascending=True, na_position="last")
 
     # Row coloring by PnL
     def _row_style(row):
@@ -236,69 +268,103 @@ def render_trades_table(trades: pd.DataFrame, title: str):
         color = "#143d2b" if val > 0 else ("#4b1f1f" if val < 0 else "transparent")
         return [f"background-color: {color}"] * len(row)
 
-    styled = view.style.apply(_row_style, axis=1)\
-                       .format({"Entry time": "{:%Y-%m-%d %H:%M}",
-                                "PnL": "${:,.2f}"})\
-                       .set_table_attributes('class="compact-table"')\
-                       .hide(axis="index")
+    def _fmt_time(x):
+        if pd.isna(x):
+            return ""
+        try:
+            return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(x)
+
+    def _fmt_money(x):
+        return "" if pd.isna(x) else f"${float(x):,.2f}"
+
+    styled = (
+        view.style
+        .apply(_row_style, axis=1)
+        .format({"Entry time": _fmt_time, "PnL": _fmt_money}, na_rep="")
+        .set_table_attributes('class="compact-table"')
+        .hide(axis="index")
+        .set_properties(**{"text-align": "center"})
+    )
 
     st.dataframe(styled, use_container_width=True)
 
-def render_user_card_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
-    # overall
-    # Accept both new and old column names
+
+# ===================================
+# AG Grid: per-user strategy selector
+# ===================================
+def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
+    # overall badge
     prem_series = _numeric_series(df_user, ["Premium", "TotalPremium", "Premium($)"])
-    pnl_series  = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
+    pnl_series = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
+    overall = _pcr(float(pnl_series.sum()), float(prem_series.sum()))
+    _user_header(user, overall)
 
-    prem_sum = float(prem_series.sum())
-    pnl_sum  = float(pnl_series.sum())
-    overall  = _pcr(pnl_sum, prem_sum)
+    # PCR table with unique columns
+    pcr = _user_strategy_pcr(df_user).copy()        # ["Strategy", "PCR"]
+    pcr.rename(columns={"Strategy": "Canonical"}, inplace=True)
+    pcr["Strategy"] = pcr["Canonical"].map(lambda s: ALIAS.get(s, s))
+    pcr["PCR %"] = pcr["PCR"].round(1)
+    pcr_for_grid = pcr[["Strategy", "PCR %"]]
 
-    st.markdown(f"### {user}")
-    st.caption(f"{overall:+.1f}% overall")
+    gb = GridOptionsBuilder.from_dataframe(pcr_for_grid)
+    gb.configure_selection("multiple", use_checkbox=True)
+    gb.configure_default_column(cellStyle={"textAlign": "center"})
 
-    # Header aligned with our compact rows (checkbox | % | strategy)
-    h0, h1, h2 = st.columns([0.07, 0.14, 0.79])
-    with h0: st.write("")
-    with h1: st.caption("PCR")
-    with h2: st.caption("Strategy")
+    # center header text
+    gb.configure_column("Strategy", headerClass="dc-center")
+    gb.configure_column(
+        "PCR %", header_name="PCR", headerClass="dc-center",
+        type=["numericColumn"],
+        valueFormatter=JsCode(
+            "function(p){return (p.value==null)?'':(Number(p.value).toFixed(1)+'%');}"
+        ),
+    )
 
-    selected: list[str] = []
-    pcr_df = _user_strategy_pcr(df_user)
+    # row fill color by PCR %
+    row_style = JsCode(
+        """
+        function(params){
+            const v = Number(params.data["PCR %"]);
+            if (isNaN(v)) return null;
+            return { backgroundColor: (v>0) ? "#143d2b" : (v<0 ? "#4b1f1f" : "transparent"),
+                     color: "white" };
+        }
+        """
+    )
 
-    # rows (wrap in a class so our compact CSS can target it)
-    st.markdown("<div class='dc-rows'>", unsafe_allow_html=True)
+    go = gb.build()
+    go["getRowStyle"] = row_style
+    go["headerHeight"] = 32
 
-    for _, r in pcr_df.iterrows():
-        sname = str(r["Strategy"])
-        pct   = float(r["PCR"]) if pd.notna(r["PCR"]) else 0.0
-        color = "#32CD32" if pct > 0 else ("#CC3333" if pct < 0 else "#AAAAAA")
+    # remember selection between reruns
+    sel_key = f"dc_sel_{user}"
+    _prev = st.session_state.get(sel_key, [])
 
-        # checkbox | % (fixed width) | strategy (flex)
-        c0, c1, c2 = st.columns([0.07, 0.14, 0.79])
+    grid = AgGrid(
+        pcr_for_grid,
+        gridOptions=go,
+        theme="streamlit",
+        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=True,
+    )
 
-        # give a real label but hide it -> fixes accessibility warnings
-        chk = c0.checkbox(
-            f"Select {user} {sname}",
-            key=f"dc_row_{user}_{sname}",
-            value=False,
-            label_visibility="collapsed",
-        )
+    picked_aliases = [r["Strategy"] for r in grid["selected_rows"]]
+    st.session_state[sel_key] = picked_aliases
 
-        c1.markdown(f"<span class='dc-pct' style='color:{color};'>{pct:+.1f}%</span>",
-                    unsafe_allow_html=True)
-        c2.write(ALIAS.get(sname, sname))
+    # map aliases back to canonical names used in your data
+    rev_alias = {v: k for k, v in ALIAS.items()}
+    return [rev_alias.get(a, a) for a in picked_aliases]
 
-        if chk:
-            selected.append(sname)
 
-    st.markdown("</div>", unsafe_allow_html=True)
-    return selected
-
-# ---------- main tab ----------
-
+# ===========
+# Main (Tab)
+# ===========
 def daily_compare_tab():
-    _inject_dc_compact_css()
+    _aggrid_css()
+
     st.subheader("Daily Compare (Google Sheets)")
 
     # Refresh button
@@ -311,7 +377,7 @@ def daily_compare_tab():
         st.info("No data found yet. Start your watchers (Raw_* tabs) and click Refresh.")
         return
 
-    # --- date range quick buttons (ordered) ---
+    # Date range presets
     min_date, max_date = df["Date"].min(), df["Date"].max()
 
     if "dc_date_range" not in st.session_state or st.session_state.dc_date_range is None:
@@ -324,7 +390,6 @@ def daily_compare_tab():
         st.session_state.dc_date_range = (clamp(start), clamp(end))
         _rerun()
 
-    # Row 1: Today, Yesterday, This Week
     r1c1, r1c2, r1c3 = st.columns(3)
     if r1c1.button("Today", key="dc_btn_today", use_container_width=True):
         t = date.today(); set_range(t, t)
@@ -333,7 +398,6 @@ def daily_compare_tab():
     if r1c3.button("This Week", key="dc_btn_this_week", use_container_width=True):
         d0 = date.today(); start = d0 - timedelta(days=d0.weekday()); set_range(start, d0)
 
-    # Row 2: Last Week, This Month, Last Month, YTD
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     if r2c1.button("Last Week", key="dc_btn_last_week", use_container_width=True):
         d0 = date.today()
@@ -369,7 +433,7 @@ def daily_compare_tab():
     # Filtered window
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
 
-    # ---- Per-user UI: card with inline toggles; below it, the trade log ----
+    # Per-user UI: each column shows picker + trades
     users_in_view = view["User"].dropna().unique().tolist()
     preferred_user_order = ["Chad", "Kelly"]
     ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
@@ -384,25 +448,27 @@ def daily_compare_tab():
         with col:
             df_user = view[view["User"] == user].copy()
 
-            picked_strats = render_user_card_with_toggles(user, df_user)
+            picked_strats = render_user_table_with_toggles(user, df_user)
 
             if picked_strats:
                 trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
                 render_trades_table(trades, title=f"{user} — selected strategy trades")
 
-    # ---- Global Strategy breakdown (selected range) ----
+    # Global Strategy breakdown (selected range)
     st.divider()
 
     df_view = view.copy()
     df_view["Premium"] = _numeric_series(df_view, ["Premium", "TotalPremium", "Premium($)"])
-    df_view["PnL"]     = _numeric_series(df_view, ["PnL", "ProfitLoss", "P/L", "PL"])
+    df_view["PnL"] = _numeric_series(df_view, ["PnL", "ProfitLoss", "P/L", "PL"])
 
     stats = (
         df_view.groupby(["User", "Strategy"], dropna=False)[["Premium", "PnL"]]
-            .sum()
-            .reset_index()
+        .sum()
+        .reset_index()
     )
-    stats["PCR %"] = np.where(stats["Premium"] != 0, (stats["PnL"] / stats["Premium"]) * 100.0, np.nan)
+    stats["PCR %"] = np.where(
+        stats["Premium"] != 0, (stats["PnL"] / stats["Premium"]) * 100.0, np.nan
+    )
     stats = stats[["User", "Strategy", "PCR %", "Premium", "PnL"]]
 
     st.subheader("Strategy breakdown (selected range)")
