@@ -35,14 +35,18 @@ def _aggrid_css() -> None:
     )
 
 
-def _user_header(name: str, overall: float) -> None:
-    """Render 'Name  [+/-X.X% overall]' tightly above the grid."""
+def _user_header(name: str, overall: float, total_pnl: float) -> None:
+    """Render 'Name  [+/-X.X% overall, $PnL]' above the grid with table-matching colors."""
     if overall > 0:
-        color, bg = "#22c55e", "rgba(34,197,94,0.12)"   # green
+        color, bg = "#ffffff", "#143d2b"   # table green
     elif overall < 0:
-        color, bg = "#ef4444", "rgba(239,68,68,0.12)"   # red
+        color, bg = "#ffffff", "#4b1f1f"   # table red
     else:
-        color, bg = "#9ca3af", "rgba(148,163,184,0.12)" # gray
+        color, bg = "#ffffff", "rgba(148,163,184,0.12)" # gray
+
+    pnl_str = f"${abs(total_pnl):,.2f}"
+    if total_pnl < 0:
+        pnl_str = f"-{pnl_str}"
 
     st.markdown(
         f"""
@@ -51,11 +55,13 @@ def _user_header(name: str, overall: float) -> None:
             {name}
           </span>
           <span style="
-            display:inline-block;padding:4px 10px;border-radius:12px;
+            display:inline-block;padding:4px 12px;border-radius:12px;
             font-weight:800;font-size:20px;line-height:1;
             color:{color} !important;background:{bg};
             border:1px solid rgba(255,255,255,0.06);
-          ">{overall:+.1f}% overall</span>
+          ">
+            {overall:+.1f}% overall &nbsp;|&nbsp; {pnl_str}
+          </span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -313,79 +319,87 @@ def render_trades_table(trades: pd.DataFrame, title: str):
 def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
     # overall badge
     prem_series = _numeric_series(df_user, ["Premium", "TotalPremium", "Premium($)"])
-    pnl_series = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
-    overall = _pcr(float(pnl_series.sum()), float(prem_series.sum()))
-    _user_header(user, overall)
+    pnl_series  = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
+    total_pnl_val = float(pnl_series.sum())
+    overall = _pcr(total_pnl_val, float(prem_series.sum()))
+    _user_header(user, overall, total_pnl_val)
 
-    # Strategy stats table with unique columns
-    stats = _user_strategy_pcr(df_user).copy()        # [Strategy, PCR, WinRate, Trades, Winners, Losers]
+    # Per-strategy stats (PCR, Win%, counts)
+    stats = _user_strategy_pcr(df_user).copy()  # columns: Strategy, PCR, WinRate, Trades, Winners, Losers
     stats.rename(columns={"Strategy": "Canonical"}, inplace=True)
     stats["Strategy"] = stats["Canonical"].map(lambda s: ALIAS.get(s, s))
     stats["PCR %"] = stats["PCR"].round(1)
     stats["Win %"] = stats["WinRate"].round(1)
 
-    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Trades", "Winners", "Losers"]]
+    # PnL mapped by canonical strategy key (prevents misalignment)
+    dfu = df_user.copy()
+    dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
+    pnl_map = dfu.groupby("Strategy", dropna=False)["PnL"].sum().to_dict()
+    stats["PnL"] = stats["Canonical"].map(pnl_map).fillna(0.0)
 
+    # Table for the grid
+    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Trades", "Winners", "Losers", "PnL"]]
+
+    # AG Grid config
     gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
     gb.configure_selection("multiple", use_checkbox=True)
     gb.configure_default_column(cellStyle={"textAlign": "center"})
 
-    # Common formatters
-    pctFmt = JsCode(
-        """
-        function(p){
-          if (p.value==null) return '';
-          const v = Number(p.value);
-          return isNaN(v) ? '' : (v.toFixed(1) + '%');
-        }
-        """
-    )
-    intFmt = JsCode(
-        """
-        function(p){
-          if (p.value==null) return '';
-          const v = Number(p.value);
-          return isNaN(v) ? '' : v.toFixed(0);
-        }
-        """
-    )
+    pctFmt = JsCode("""
+      function(p){
+        if (p.value==null) return '';
+        const v = Number(p.value);
+        return isNaN(v) ? '' : (v.toFixed(1) + '%');
+      }
+    """)
+    intFmt = JsCode("""
+      function(p){
+        if (p.value==null) return '';
+        const v = Number(p.value);
+        return isNaN(v) ? '' : v.toFixed(0);
+      }
+    """)
+    moneyFmt = JsCode("""
+      function(p){
+        if (p.value==null) return '';
+        const v = Number(p.value);
+        if (isNaN(v)) return '';
+        const abs = Math.abs(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+        return (v < 0 ? '-$' : '$') + abs;
+      }
+    """)
 
-    # Center header text
     gb.configure_column("Strategy", headerClass="dc-center")
     gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Trades", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
     gb.configure_column("Winners", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
     gb.configure_column("Losers", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("PnL", header_name="PnL", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
 
-    # row fill color by PCR %
-    row_style = JsCode(
-        """
-        function(params){
-            const v = Number(params.data["PCR %"]);
-            if (isNaN(v)) return null;
-            return { backgroundColor: (v>0) ? "#143d2b" : (v<0 ? "#4b1f1f" : "transparent"),
-                     color: "white" };
-        }
-        """
-    )
+    # Row color by PCR
+    row_style = JsCode("""
+      function(params){
+        const v = Number(params.data["PCR %"]);
+        if (isNaN(v)) return null;
+        return { backgroundColor: (v>0) ? "#143d2b" : (v<0 ? "#4b1f1f" : "transparent"),
+                 color: "white" };
+      }
+    """)
 
     go = gb.build()
     go["getRowStyle"] = row_style
     go["headerHeight"] = 32
-
     go["suppressSizeToFit"] = True
     go["onFirstDataRendered"] = JsCode("""
-    function(params){
-    const all = params.columnApi.getAllDisplayedColumns();
-    // Size each column just wider than its content + header
-    params.columnApi.autoSizeColumns(all, false);
-    }
+      function(params){
+        const all = params.columnApi.getAllDisplayedColumns();
+        params.columnApi.autoSizeColumns(all, false);
+      }
     """)
 
-    # remember selection between reruns
+    # Remember selection
     sel_key = f"dc_sel_{user}"
-    _prev = st.session_state.get(sel_key, [])
 
     grid = AgGrid(
         stats_for_grid,
@@ -399,7 +413,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     picked_aliases = [r["Strategy"] for r in grid["selected_rows"]]
     st.session_state[sel_key] = picked_aliases
 
-    # map aliases back to canonical names used in your data
+    # Map back to canonical names for filtering trades
     rev_alias = {v: k for k, v in ALIAS.items()}
     return [rev_alias.get(a, a) for a in picked_aliases]
 
