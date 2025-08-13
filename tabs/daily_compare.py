@@ -1,4 +1,3 @@
-# tabs/daily_compare.py
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -210,23 +209,40 @@ def _pcr(pnl_sum: float, prem_sum: float) -> float:
 
 
 def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
-    """Return Strategy + PCR% for a single user's filtered window."""
+    """Return per-strategy PCR%, Win%, Trades, Winners, Losers for a single user's filtered window."""
     if df_user.empty:
-        return pd.DataFrame(columns=["Strategy", "PCR"])
+        return pd.DataFrame(columns=["Strategy", "PCR", "WinRate", "Trades", "Winners", "Losers"])  # empty shape
 
     dfu = df_user.copy()
     dfu["Premium"] = _numeric_series(dfu, ["Premium", "TotalPremium", "Premium($)"])
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
 
+    # Aggregate per strategy
     g = (
-        dfu.groupby("Strategy", dropna=False)[["Premium", "PnL"]]
-        .sum()
-        .reset_index()
+        dfu.groupby("Strategy", dropna=False)
+           .agg(
+               Premium=("Premium", "sum"),
+               PnL=("PnL", "sum"),
+               Trades=("PnL", "count"),           # count of rows with non-null PnL
+               Winners=("PnL", lambda s: (s > 0).sum()),
+               Losers=("PnL", lambda s: (s < 0).sum()),
+           )
+           .reset_index()
     )
-    g["PCR"] = np.where(g["Premium"] != 0, (g["PnL"] / g["Premium"]) * 100.0, 0.0)
+
+    # Derived metrics
+    g["PCR"] = np.where(g["Premium"] != 0, (g["PnL"] / g["Premium"]) * 100.0, np.nan)
+    denom = g["Winners"] + g["Losers"]
+    g["WinRate"] = np.where(denom > 0, (g["Winners"] / denom) * 100.0, np.nan)
+
     g["Strategy"] = g["Strategy"].astype(str)
     g = g.sort_values("Strategy", key=lambda s: s.map(_order_key))
-    return g[["Strategy", "PCR"]]
+
+    # Ensure integer dtypes for count columns
+    for c in ("Trades", "Winners", "Losers"):
+        g[c] = g[c].fillna(0).astype(int)
+
+    return g[["Strategy", "PCR", "WinRate", "Trades", "Winners", "Losers"]]
 
 
 def render_trades_table(trades: pd.DataFrame, title: str):
@@ -301,26 +317,46 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     overall = _pcr(float(pnl_series.sum()), float(prem_series.sum()))
     _user_header(user, overall)
 
-    # PCR table with unique columns
-    pcr = _user_strategy_pcr(df_user).copy()        # ["Strategy", "PCR"]
-    pcr.rename(columns={"Strategy": "Canonical"}, inplace=True)
-    pcr["Strategy"] = pcr["Canonical"].map(lambda s: ALIAS.get(s, s))
-    pcr["PCR %"] = pcr["PCR"].round(1)
-    pcr_for_grid = pcr[["Strategy", "PCR %"]]
+    # Strategy stats table with unique columns
+    stats = _user_strategy_pcr(df_user).copy()        # [Strategy, PCR, WinRate, Trades, Winners, Losers]
+    stats.rename(columns={"Strategy": "Canonical"}, inplace=True)
+    stats["Strategy"] = stats["Canonical"].map(lambda s: ALIAS.get(s, s))
+    stats["PCR %"] = stats["PCR"].round(1)
+    stats["Win %"] = stats["WinRate"].round(1)
 
-    gb = GridOptionsBuilder.from_dataframe(pcr_for_grid)
+    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Trades", "Winners", "Losers"]]
+
+    gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
     gb.configure_selection("multiple", use_checkbox=True)
     gb.configure_default_column(cellStyle={"textAlign": "center"})
 
-    # center header text
-    gb.configure_column("Strategy", headerClass="dc-center")
-    gb.configure_column(
-        "PCR %", header_name="PCR", headerClass="dc-center",
-        type=["numericColumn"],
-        valueFormatter=JsCode(
-            "function(p){return (p.value==null)?'':(Number(p.value).toFixed(1)+'%');}"
-        ),
+    # Common formatters
+    pctFmt = JsCode(
+        """
+        function(p){
+          if (p.value==null) return '';
+          const v = Number(p.value);
+          return isNaN(v) ? '' : (v.toFixed(1) + '%');
+        }
+        """
     )
+    intFmt = JsCode(
+        """
+        function(p){
+          if (p.value==null) return '';
+          const v = Number(p.value);
+          return isNaN(v) ? '' : v.toFixed(0);
+        }
+        """
+    )
+
+    # Center header text
+    gb.configure_column("Strategy", headerClass="dc-center")
+    gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Trades", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("Winners", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("Losers", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
 
     # row fill color by PCR %
     row_style = JsCode(
@@ -352,7 +388,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     _prev = st.session_state.get(sel_key, [])
 
     grid = AgGrid(
-        pcr_for_grid,
+        stats_for_grid,
         gridOptions=go,
         theme="streamlit",
         update_mode=GridUpdateMode.SELECTION_CHANGED,
@@ -389,14 +425,15 @@ def daily_compare_tab():
     # Date range presets
     min_date, max_date = df["Date"].min(), df["Date"].max()
 
-    if "dc_date_range" not in st.session_state or st.session_state.dc_date_range is None:
-        st.session_state.dc_date_range = (max_date, max_date)
+    # Initialize once, keep Session State as the single source of truth
+    default_range = (max_date, max_date)
+    st.session_state.setdefault("dc_date_range", default_range)
 
     def clamp(d: date) -> date:
         return max(min(d, max_date), min_date)
 
     def set_range(start: date, end: date):
-        st.session_state.dc_date_range = (clamp(start), clamp(end))
+        st.session_state["dc_date_range"] = (clamp(start), clamp(end))
         _rerun()
 
     r1c1, r1c2, r1c3 = st.columns(3)
@@ -424,20 +461,18 @@ def daily_compare_tab():
     if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
-    # Date picker AFTER buttons
-    start, end = st.session_state.dc_date_range
-    st.session_state.dc_date_range = (clamp(start), clamp(end))
-    picked = st.date_input(
+    # Date picker AFTER buttons. Do not pass `value=` to avoid two sources of truth.
+    start, end = st.session_state["dc_date_range"]
+    st.session_state["dc_date_range"] = (clamp(start), clamp(end))
+    _ = st.date_input(
         "Date range",
-        value=st.session_state.dc_date_range,
+        key="dc_date_range",
         min_value=min_date,
         max_value=max_date,
-        key="dc_date_range",
     )
-    if isinstance(picked, (tuple, list)):
-        d1, d2 = picked
-    else:
-        d1, d2 = st.session_state.dc_date_range
+
+    # Use session state as the single source of truth for filtering
+    d1, d2 = st.session_state["dc_date_range"]
 
     # Filtered window
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()

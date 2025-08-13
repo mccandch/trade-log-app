@@ -260,6 +260,20 @@ def lvb_greedy_match_with_tolerance(live_df: pd.DataFrame, back_df: pd.DataFrame
 
 
 # ---------------- Styling helpers ----------------
+def lvb_render_table_html(
+    df,
+    currency_cols,
+    percent_cols,
+    posneg_cols,
+    pair_band: bool,
+    band_stride: int,
+) -> str:
+    styler = lvb_style_table_center_currency_percent(
+        df, currency_cols, percent_cols, posneg_cols, pair_band, band_stride
+    ).set_table_attributes('class="compact-table"')
+    return styler.to_html()
+
+
 def lvb_style_table_center_currency_percent(
     df: pd.DataFrame,
     currency_cols: List[str],
@@ -299,6 +313,16 @@ def lvb_style_table_center_currency_percent(
                 return styles
             styler = styler.apply(_pair_border_thick, axis=None)
 
+    # Only color rows if a 'Source' column exists
+    if "Source" in df.columns:
+        def _source_color(row: pd.Series):
+            if "Source" not in row.index:
+                return [""] * len(row)
+            is_live = str(row["Source"]).strip().lower().startswith("live")
+            color = "#FFFFFF" if is_live else "#B8A15A"  # muted gold for Backtest
+            return [f"color: {color};"] * len(row)
+        styler = styler.apply(_source_color, axis=1)
+
     def _color_posneg(v):
         if pd.isna(v): return ""
         try: v = float(v)
@@ -313,7 +337,6 @@ def lvb_style_table_center_currency_percent(
     styler = styler.set_table_styles([{"selector": "th, td", "props": [("text-align", "center")]}], overwrite=False)
     return styler
 
-
 def lvb_render_table_html(
     df: pd.DataFrame,
     currency_cols: List[str],
@@ -327,45 +350,63 @@ def lvb_render_table_html(
     ).set_table_attributes('class="compact-table"')
     return styler.to_html()
 
-
 # ---------------- UI ----------------
 def main():
     st.subheader("Compare Logs — Live vs Backtest")
 
+    # Inject CSS for Backtest KPI colors
+    st.markdown("""
+    <style>
+    .backtest-kpis [data-testid="stMetric"],
+    .backtest-kpis [data-testid="stMetric"] * {
+        color: #B8A15A !important; /* muted gold */
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     left, right = st.columns([0.32, 0.68], gap="large")
     with left:
-        # Date range
         if "lv_start_date" not in st.session_state:
             st.session_state.lv_start_date = date.today() - timedelta(days=60)
         if "lv_end_date" not in st.session_state:
             st.session_state.lv_end_date = date.today()
 
         st.markdown("##### Filters")
-        range_val = st.date_input("Date range",
-                                  value=(st.session_state.lv_start_date, st.session_state.lv_end_date),
-                                  key="lvb_date_range")
+        range_val = st.date_input(
+            "Date range",
+            value=(st.session_state.lv_start_date, st.session_state.lv_end_date),
+            key="lvb_date_range",
+        )
         if isinstance(range_val, tuple) and len(range_val) == 2:
             st.session_state.lv_start_date, st.session_state.lv_end_date = range_val
 
         c1, c2, c3 = st.columns(3)
-        if c1.button("This Week", use_container_width=True):
-            d0 = date.today(); s = d0 - timedelta(days=d0.weekday())
+        if c1.button("This Week", key="lvb_btn_this_week", use_container_width=True):
+            d0 = date.today()
+            s = d0 - timedelta(days=d0.weekday())
             st.session_state.lv_start_date, st.session_state.lv_end_date = s, d0
-        if c2.button("Last Week", use_container_width=True):
-            d0 = date.today(); this_mon = d0 - timedelta(days=d0.weekday()); last_mon = this_mon - timedelta(days=7)
+        if c2.button("Last Week", key="lvb_btn_last_week", use_container_width=True):
+            d0 = date.today()
+            this_mon = d0 - timedelta(days=d0.weekday())
+            last_mon = this_mon - timedelta(days=7)
             st.session_state.lv_start_date, st.session_state.lv_end_date = last_mon, last_mon + timedelta(days=6)
-        if c3.button("This Month", use_container_width=True):
-            d0 = date.today(); s = d0.replace(day=1)
-            st.session_state.lv_start_date, st.session_state.lv_end_date = s, d0
+        if c3.button("This Month", key="lvb_btn_this_month", use_container_width=True):
+            d0 = date.today()
+            st.session_state.lv_start_date, st.session_state.lv_end_date = d0.replace(day=1), d0
 
-        c4, c5, c6 = st.columns(3)
-        if c4.button("Last Month", use_container_width=True):
-            d0 = date.today(); first_this = d0.replace(day=1); last_prev = first_this - timedelta(days=1); first_prev = last_prev.replace(day=1)
+        d1c, d2c, d3c = st.columns(3)
+        if d1c.button("Last Month", key="lvb_btn_last_month", use_container_width=True):
+            d0 = date.today()
+            first_this = d0.replace(day=1)
+            last_prev = first_this - timedelta(days=1)
+            first_prev = last_prev.replace(day=1)
             st.session_state.lv_start_date, st.session_state.lv_end_date = first_prev, last_prev
-        if c5.button("YTD", use_container_width=True):
-            d0 = date.today(); st.session_state.lv_start_date, st.session_state.lv_end_date = date(d0.year,1,1), d0
-        if c6.button("Today", use_container_width=True):
-            d0 = date.today(); st.session_state.lv_start_date, st.session_state.lv_end_date = d0, d0
+        if d2c.button("YTD", key="lvb_btn_ytd", use_container_width=True):
+            d0 = date.today()
+            st.session_state.lv_start_date, st.session_state.lv_end_date = date(d0.year,1,1), d0
+        if d3c.button("Today", key="lvb_btn_today", use_container_width=True):
+            d0 = date.today()
+            st.session_state.lv_start_date, st.session_state.lv_end_date = d0, d0
 
         st.divider()
         tolerance = st.number_input("Time tolerance (minutes)", min_value=0, max_value=60, value=2, step=1, key="tol_minutes")
@@ -578,6 +619,18 @@ def main():
                 st.info("No trades in the selected window for the line chart.")
 
         # KPIs
+        # Inject CSS to color Backtest KPI labels & values
+        st.markdown("""
+            <style>
+            div[data-testid="stMetric"] p:contains("Backtest") {
+                color: #B8A15A !important;
+            }
+            div[data-testid="stMetric"] div:has(p:contains("Backtest")) {
+                color: #B8A15A !important;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
         st.markdown("### Summary KPIs (for selected strategies)")
         def agg_summary(df_stats: pd.DataFrame) -> Tuple[int, float, float, float, float]:
             if df_stats.empty: return 0, 0.0, 0.0, 0.0, 0.0
@@ -595,13 +648,14 @@ def main():
         l3.metric("Live Premium Sold", f"${live_sold:,.0f}")
         l4.metric("Live Premium Captured", f"${live_cap:,.0f}")
         l5.metric("Live PCR", f"{live_pcr:.1f}%")
+        st.markdown('<div class="backtest-kpis">', unsafe_allow_html=True)
         b1, b2, b3, b4, b5 = st.columns(5)
         b1.metric("Backtest Trades", f"{back_trades:,}")
         b2.metric("Backtest Win Rate", f"{back_wr:.1f}%")
         b3.metric("Backtest Premium Sold", f"${back_sold:,.0f}")
         b4.metric("Backtest Premium Captured", f"${back_cap:,.0f}")
         b5.metric("Backtest PCR", f"{back_pcr:.1f}%")
-
+        st.markdown('</div>', unsafe_allow_html=True)
         # Tolerance matching + detail tables
         matches = lvb_greedy_match_with_tolerance(live_sel, back_sel, st.session_state.tol_minutes)
         if matches.empty:
