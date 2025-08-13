@@ -15,6 +15,11 @@ except ModuleNotFoundError:
     yaml = None
 
 
+color_scale = alt.Scale(
+    domain=["Live", "Backtest"],  # Match exactly how 'Source' appears in your data
+    range=["#FFFFFF", "#B8A15A"]   # Live=white, Backtest=muted gold
+)
+
 def _rerun():
     try:
         st.experimental_rerun()
@@ -332,7 +337,7 @@ def lvb_style_table_center_currency_percent(
         return ""
     for c in posneg_cols:
         if c in df.columns:
-            styler = styler.applymap(_color_posneg, subset=pd.IndexSlice[:, [c]])
+            styler = styler.map(_color_posneg, subset=pd.IndexSlice[:, [c]])
 
     styler = styler.set_table_styles([{"selector": "th, td", "props": [("text-align", "center")]}], overwrite=False)
     return styler
@@ -353,6 +358,22 @@ def lvb_render_table_html(
 # ---------------- UI ----------------
 def main():
     st.subheader("Compare Logs — Live vs Backtest")
+
+    st.markdown("""
+    <style>
+    /* Target the selected items (tags) in multiselect */
+    .stMultiSelect [data-baseweb="tag"] {
+        background-color: #1E90FF !important;  /* DodgerBlue */
+        color: white !important;               /* Text color */
+    }
+
+    /* Optional: Change hover color of the 'x' remove icon */
+    .stMultiSelect [data-baseweb="tag"] svg {
+        fill: white !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 
     # Inject CSS for Backtest KPI colors
     st.markdown("""
@@ -550,7 +571,7 @@ def main():
                         x=alt.X("Strategy:N", sort=strat_order, title=None, axis=alt.Axis(labelAngle=-30)),
                         xOffset=alt.XOffset("Source:N"),
                         y=alt.Y(f"{metric}:Q", title=metric),
-                        color=alt.Color("Source:N", legend=alt.Legend(orient="bottom")),
+                        color=alt.Color("Source:N",scale = color_scale, legend=alt.Legend(orient="bottom")),
                         tooltip=["Strategy", "Source", tooltip_for(metric)],
                     )
                     .properties(height=250)
@@ -602,7 +623,7 @@ def main():
                     .encode(
                         x=alt.X("Date:T", title=None),
                         y=alt.Y("Value:Q", title=y_title),
-                        color=alt.Color("Source:N", legend=alt.Legend(orient="bottom")),
+                        color=alt.Color("Source:N",scale=color_scale, legend=alt.Legend(orient="bottom")),
                         tooltip=[
                             alt.Tooltip("Date:T", title="Date"),
                             "Source:N",
@@ -620,16 +641,33 @@ def main():
 
         # KPIs
         # Inject CSS to color Backtest KPI labels & values
+        # Scoped KPI colors: Backtest = muted gold, Live = white
+        # 1) CSS (once)
         st.markdown("""
-            <style>
-            div[data-testid="stMetric"] p:contains("Backtest") {
-                color: #B8A15A !important;
-            }
-            div[data-testid="stMetric"] div:has(p:contains("Backtest")) {
-                color: #B8A15A !important;
-            }
-            </style>
+        <style>
+        .metric-card { margin: 0 0 1rem 0; }
+        .metric-card .metric-label {
+        font-size: .9rem; line-height: 1.1; margin-bottom: .35rem;
+        color: #FFFFFF; opacity: .85;
+        }
+        .metric-card .metric-value {
+        font-size: 2.2rem; font-weight: 700; letter-spacing: .2px;
+        }
+        .metric-card.gold .metric-label,
+        .metric-card.gold .metric-value { color: #B8A15A !important; } /* muted gold */
+        </style>
         """, unsafe_allow_html=True)
+
+        # 2) Helper
+        def metric_html(label: str, value: str, gold: bool = False) -> str:
+            cls = "metric-card gold" if gold else "metric-card"
+            return f"""
+        <div class="{cls}">
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+        </div>
+        """
+
 
         st.markdown("### Summary KPIs (for selected strategies)")
         def agg_summary(df_stats: pd.DataFrame) -> Tuple[int, float, float, float, float]:
@@ -642,20 +680,23 @@ def main():
             return trades, winrate, prem_sold, prem_cap, pcr
         live_trades, live_wr, live_sold, live_cap, live_pcr = agg_summary(lvb_compute_strategy_stats(lvb_prepare_for_stats(live_sel, st.session_state.view_mode)[0], "StrategyKey"))
         back_trades, back_wr, back_sold, back_cap, back_pcr = agg_summary(lvb_compute_strategy_stats(lvb_prepare_for_stats(back_sel, st.session_state.view_mode)[0], "StrategyKey"))
+
+        # Live KPIs (wrap in .live-kpis)
         l1, l2, l3, l4, l5 = st.columns(5)
         l1.metric("Live Trades", f"{live_trades:,}")
         l2.metric("Live Win Rate", f"{live_wr:.1f}%")
         l3.metric("Live Premium Sold", f"${live_sold:,.0f}")
         l4.metric("Live Premium Captured", f"${live_cap:,.0f}")
         l5.metric("Live PCR", f"{live_pcr:.1f}%")
-        st.markdown('<div class="backtest-kpis">', unsafe_allow_html=True)
+
+        # Backtest KPIs (HTML so we can color them)
         b1, b2, b3, b4, b5 = st.columns(5)
-        b1.metric("Backtest Trades", f"{back_trades:,}")
-        b2.metric("Backtest Win Rate", f"{back_wr:.1f}%")
-        b3.metric("Backtest Premium Sold", f"${back_sold:,.0f}")
-        b4.metric("Backtest Premium Captured", f"${back_cap:,.0f}")
-        b5.metric("Backtest PCR", f"{back_pcr:.1f}%")
-        st.markdown('</div>', unsafe_allow_html=True)
+        b1.markdown(metric_html("Backtest Trades", f"{back_trades:,}", gold=True), unsafe_allow_html=True)
+        b2.markdown(metric_html("Backtest Win Rate", f"{back_wr:.1f}%", gold=True), unsafe_allow_html=True)
+        b3.markdown(metric_html("Backtest Premium Sold", f"${back_sold:,.0f}", gold=True), unsafe_allow_html=True)
+        b4.markdown(metric_html("Backtest Premium Captured", f"${back_cap:,.0f}", gold=True), unsafe_allow_html=True)
+        b5.markdown(metric_html("Backtest PCR", f"{back_pcr:.1f}%", gold=True), unsafe_allow_html=True)
+
         # Tolerance matching + detail tables
         matches = lvb_greedy_match_with_tolerance(live_sel, back_sel, st.session_state.tol_minutes)
         if matches.empty:
