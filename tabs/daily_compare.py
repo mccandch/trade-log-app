@@ -17,6 +17,14 @@ from google.oauth2.service_account import Credentials
 # =========================
 # CSS helpers (runtime only)
 # =========================
+def _df_no_index(df: pd.DataFrame):
+    """Render a dataframe without showing its index/row numbers."""
+    st.dataframe(
+        df.reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,   # <- this actually hides the 0,1,2 row numbers
+    )
+
 def _aggrid_css() -> None:
     """Inject CSS for centered headers and tight spacing. Call at the start of the tab."""
     st.markdown(
@@ -281,6 +289,8 @@ def render_trades_table(trades: pd.DataFrame, title: str):
     if "Entry time" in view.columns:
         view = view.sort_values(by="Entry time", ascending=True, na_position="last")
 
+    # Drop the index here so IDs like 1450, 1451 don’t appear
+    view = view.reset_index(drop=True)
     # Row coloring by PnL
     def _row_style(row):
         try:
@@ -301,6 +311,7 @@ def render_trades_table(trades: pd.DataFrame, title: str):
     def _fmt_money(x):
         return "" if pd.isna(x) else f"${float(x):,.2f}"
 
+
     styled = (
         view.style
         .apply(_row_style, axis=1)
@@ -310,7 +321,7 @@ def render_trades_table(trades: pd.DataFrame, title: str):
         .set_properties(**{"text-align": "center"})
     )
 
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ===================================
@@ -530,4 +541,4 @@ def daily_compare_tab():
     stats = stats[["User", "Strategy", "PCR %", "Premium", "PnL"]]
 
     st.subheader("Strategy breakdown (selected range)")
-    st.dataframe(stats, use_container_width=True)
+    _df_no_index(stats)
