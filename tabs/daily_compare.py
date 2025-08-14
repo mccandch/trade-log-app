@@ -61,16 +61,20 @@ def _aggrid_css() -> None:
     )
 
 
-def _user_header(name: str, overall: float, total_pnl: float) -> None:
-    """Render 'Name  [+/-X.X% overall, $PnL]' above the grid with table-matching colors."""
-    if overall > 0:
-        color, bg = "#ffffff", "#143d2b"   # table green
-    elif overall < 0:
-        color, bg = "#ffffff", "#4b1f1f"   # table red
+def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: float) -> None:
+    """Render 'Name  [PCR: ±X.X% | Win Rate: X.X% | $±N]' with table-matching colors."""
+    # Match the same green/red as your grid rows
+    if pcr_pct > 0:
+        txt_color, bg = "#ffffff", "#143d2b"   # green
+    elif pcr_pct < 0:
+        txt_color, bg = "#ffffff", "#4b1f1f"   # red
     else:
-        color, bg = "#ffffff", "rgba(148,163,184,0.12)" # gray
+        txt_color, bg = "#ffffff", "rgba(148,163,184,0.12)"  # gray
 
-    pnl_str = f"${abs(total_pnl):,.2f}"
+    # Format parts
+    pcr_str  = f"{pcr_pct:+.1f}%"                     # include sign; change to abs if you prefer no sign
+    win_str  = f"{win_rate_pct:.1f}%"
+    pnl_str  = f"${abs(total_pnl):,.2f}"
     if total_pnl < 0:
         pnl_str = f"-{pnl_str}"
 
@@ -83,10 +87,10 @@ def _user_header(name: str, overall: float, total_pnl: float) -> None:
           <span style="
             display:inline-block;padding:4px 12px;border-radius:12px;
             font-weight:800;font-size:20px;line-height:1;
-            color:{color} !important;background:{bg};
+            color:{txt_color} !important;background:{bg};
             border:1px solid rgba(255,255,255,0.06);
           ">
-            {overall:+.1f}% overall &nbsp;|&nbsp; {pnl_str}
+            PCR: {pcr_str} &nbsp;|&nbsp; Win Rate: {win_str} &nbsp;|&nbsp; {pnl_str}
           </span>
         </div>
         """,
@@ -370,9 +374,16 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     # overall badge
     prem_series = _numeric_series(df_user, ["Premium", "TotalPremium", "Premium($)"])
     pnl_series  = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
+
     total_pnl_val = float(pnl_series.sum())
-    overall = _pcr(total_pnl_val, float(prem_series.sum()))
-    _user_header(user, overall, total_pnl_val)
+    pcr_pct       = _pcr(total_pnl_val, float(prem_series.sum()))
+
+    wins   = int((pnl_series > 0).sum())
+    losses = int((pnl_series < 0).sum())
+    denom  = wins + losses
+    win_rate_pct = (wins / denom) * 100.0 if denom > 0 else 0.0
+
+    _user_header(name=user, pcr_pct=pcr_pct, win_rate_pct=win_rate_pct, total_pnl=total_pnl_val)
 
     # Per-strategy stats (PCR, Win%, counts)
     stats = _user_strategy_pcr(df_user).copy()  # columns: Strategy, PCR, WinRate, Trades, Winners, Losers
