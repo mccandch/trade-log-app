@@ -540,45 +540,33 @@ def daily_compare_tab():
     if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
-    # Date picker AFTER buttons. Do not pass `value=` to avoid two sources of truth.
-    # Expect min_date/max_date and a clamp(d) helper to exist.
-    # Example clamp if you need it:
-    # def clamp(d): return max(min(d, max_date), min_date)
+    # --- Date range widget (range mode). Do NOT pre-write to dc_date_range.
+    def clamp(d: date) -> date:
+        return max(min(d, max_date), min_date)
 
-    rng = st.session_state.get("dc_date_range", (max_date, max_date))
+    # --- Date range widget (range mode). Do NOT pre-write to dc_date_range.
+    prev_range = st.session_state.get("dc_date_range", (max_date, max_date))
 
-    # Coerce whatever is in session into a 2-tuple (start, end)
-    if isinstance(rng, (list, tuple)):
-        if len(rng) == 2:
-            start, end = rng
-        elif len(rng) == 1:
-            start = end = rng[0]
-        else:
-            start = end = max_date
-    elif isinstance(rng, date):
-        start = end = rng
-    else:
-        start = end = max_date
-
-    # Clamp and persist normalized value before rendering the widget
-    start, end = clamp(start), clamp(end)
-    st.session_state["dc_date_range"] = (start, end)
-
-    # Now render the widget; it will read/write the same key
-    _ = st.date_input(
+    picked = st.date_input(
         "Date range",
-        key="dc_date_range",
+        value=prev_range,      # 2-tuple -> enables range selection UI
         min_value=min_date,
         max_value=max_date,
-    )    
+        key="dc_date_input",   # different key than the stored range
+    )
 
-    # Use session state as the single source of truth for filtering
-    d1, d2 = st.session_state["dc_date_range"]
+    # Decide d1, d2 in ALL cases
+    if isinstance(picked, (list, tuple)) and len(picked) == 2:
+        d1, d2 = map(clamp, picked)
+        st.session_state["dc_date_range"] = (d1, d2)
+    elif isinstance(picked, date):
+        d1 = d2 = clamp(picked)                 # first click
+    else:
+        d1, d2 = map(clamp, prev_range)         # fallback
 
-    # Filtered window
+    # ---- Now compute the filtered view and user list (ALWAYS) ----
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
 
-    # Per-user UI: each column shows picker + trades
     users_in_view = view["User"].dropna().unique().tolist()
     preferred_user_order = ["Chad", "Kelly"]
     ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
@@ -586,15 +574,13 @@ def daily_compare_tab():
 
     if not ordered_users:
         st.warning("Nobody placed any trades for the selected date range.")
-        return
+        st.stop()  # or return
 
     cols = st.columns(len(ordered_users))
     for col, user in zip(cols, ordered_users):
         with col:
             df_user = view[view["User"] == user].copy()
-
             picked_strats = render_user_table_with_toggles(user, df_user)
-
             if picked_strats:
                 trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
                 render_trades_table(trades, title=f"{user} — selected strategy trades")
