@@ -541,14 +541,36 @@ def daily_compare_tab():
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
     # Date picker AFTER buttons. Do not pass `value=` to avoid two sources of truth.
-    start, end = st.session_state["dc_date_range"]
-    st.session_state["dc_date_range"] = (clamp(start), clamp(end))
+    # Expect min_date/max_date and a clamp(d) helper to exist.
+    # Example clamp if you need it:
+    # def clamp(d): return max(min(d, max_date), min_date)
+
+    rng = st.session_state.get("dc_date_range", (max_date, max_date))
+
+    # Coerce whatever is in session into a 2-tuple (start, end)
+    if isinstance(rng, (list, tuple)):
+        if len(rng) == 2:
+            start, end = rng
+        elif len(rng) == 1:
+            start = end = rng[0]
+        else:
+            start = end = max_date
+    elif isinstance(rng, date):
+        start = end = rng
+    else:
+        start = end = max_date
+
+    # Clamp and persist normalized value before rendering the widget
+    start, end = clamp(start), clamp(end)
+    st.session_state["dc_date_range"] = (start, end)
+
+    # Now render the widget; it will read/write the same key
     _ = st.date_input(
         "Date range",
         key="dc_date_range",
         min_value=min_date,
         max_value=max_date,
-    )
+    )    
 
     # Use session state as the single source of truth for filtering
     d1, d2 = st.session_state["dc_date_range"]
