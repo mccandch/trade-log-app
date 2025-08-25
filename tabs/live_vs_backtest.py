@@ -477,6 +477,9 @@ def main():
         live_sel = _keep(live_sel_full)
         back_sel = _keep(back_sel_full)
 
+        if live_sel.empty and back_sel.empty:
+            st.info(f"No trades found between {start_date} and {end_date}. Try expanding the date range.")
+
         live_prepped, _ = lvb_prepare_for_stats(live_sel, st.session_state.view_mode)
         back_prepped, _ = lvb_prepare_for_stats(back_sel, st.session_state.view_mode)
 
@@ -491,37 +494,52 @@ def main():
         for _, r in merged.iterrows():
             strat = r["StrategyKey"]
             stack_rows.append({"Strategy": strat, "Source": "Live",
-                               "Trades": r["Trades (Live)"], "Win Rate %": r["Win Rate % (Live)"],
-                               "Premium Sold": r["Premium Sold (Live)"], "Premium Captured": r["Premium Captured (Live)"],
-                               "PCR %": r["PCR % (Live)"]})
+                            "Trades": r["Trades (Live)"], "Win Rate %": r["Win Rate % (Live)"],
+                            "Premium Sold": r["Premium Sold (Live)"], "Premium Captured": r["Premium Captured (Live)"],
+                            "PCR %": r["PCR % (Live)"]})
             stack_rows.append({"Strategy": strat, "Source": "Backtest",
-                               "Trades": r["Trades (Backtest)"], "Win Rate %": r["Win Rate % (Backtest)"],
-                               "Premium Sold": r["Premium Sold (Backtest)"], "Premium Captured": r["Premium Captured (Backtest)"],
-                               "PCR %": r["PCR % (Backtest)"]})
-        comparison_stacked = pd.DataFrame(stack_rows)
+                            "Trades": r["Trades (Backtest)"], "Win Rate %": r["Win Rate % (Backtest)"],
+                            "Premium Sold": r["Premium Sold (Backtest)"], "Premium Captured": r["Premium Captured (Backtest)"],
+                            "PCR %": r["PCR % (Backtest)"]})
+
+        expected_cols = ["Strategy","Source","Trades","Win Rate %","Premium Sold","Premium Captured","PCR %"]
+        if stack_rows:
+            comparison_stacked = pd.DataFrame(stack_rows)
+        else:
+            # ensure downstream code always sees the expected schema
+            comparison_stacked = pd.DataFrame(columns=expected_cols)
+
         if not comparison_stacked.empty:
-            comparison_stacked["Source"] = pd.Categorical(comparison_stacked["Source"], categories=["Live", "Backtest"], ordered=True)
+            comparison_stacked["Source"] = pd.Categorical(
+                comparison_stacked["Source"], categories=["Live", "Backtest"], ordered=True
+            )
             comparison_stacked = comparison_stacked.sort_values(["Strategy", "Source"]).reset_index(drop=True)
 
-        if st.session_state.source_filter != "Both":
-            allowed = ["Live"] if st.session_state.source_filter == "Live only" else ["Backtest"]
-            comparison_stacked = comparison_stacked[comparison_stacked["Source"].isin(allowed)].reset_index(drop=True)
 
         # Totals rows
         def _summary_row(df: pd.DataFrame, src: str) -> Optional[dict]:
+            # If there's no data or no 'Source' column, there's nothing to summarize
+            if df is None or df.empty or "Source" not in df.columns:
+                return None
+
             sub = df[df["Source"] == src]
-            if sub.empty: return None
+            if sub.empty:
+                return None
+
             trades = pd.to_numeric(sub["Trades"], errors="coerce").fillna(0)
             wr     = pd.to_numeric(sub["Win Rate %"], errors="coerce").fillna(0)
             sold   = pd.to_numeric(sub["Premium Sold"], errors="coerce").fillna(0)
             cap    = pd.to_numeric(sub["Premium Captured"], errors="coerce").fillna(0)
+
             t_sum = float(trades.sum())
             w_wr  = float((wr * trades).sum() / t_sum) if t_sum > 0 else 0.0
             s_sum = float(sold.sum())
             c_sum = float(cap.sum())
             pcr   = float((c_sum / s_sum) * 100.0) if s_sum else 0.0
+
             return {"Strategy": "All Selected (Total)", "Source": src, "Trades": t_sum,
                     "Win Rate %": w_wr, "Premium Sold": s_sum, "Premium Captured": c_sum, "PCR %": pcr}
+
 
         totals = []
         if st.session_state.source_filter in ("Both", "Live only"):
