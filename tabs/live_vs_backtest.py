@@ -116,6 +116,12 @@ def lvb_df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
 
+def _num_col(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    # Always return a float Series; if column is missing, return a default-valued Series
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").astype(float).fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
+
 
 # ---------------- Normalization + stats ----------------
 def lvb_live_side_from_tradetype(trade_type: str) -> Optional[str]:
@@ -138,7 +144,7 @@ def lvb_normalize_live(raw: pd.DataFrame) -> pd.DataFrame:
     df = df[df.get("Strategy","") != "Megatrend"].copy()
     df["StrategyMapped"] = df["Strategy"].apply(lambda x: lvb_map_strategy_name("live", x)[0])
     df["PremiumSold"] = pd.to_numeric(df.get("TotalPremium", 0), errors="coerce").abs().fillna(0).round(2)
-    df["PnL"] = pd.to_numeric(df.get("ProfitLoss", 0), errors="coerce").fillna(0.0)
+    df["PnL"] = _num_col(df, "ProfitLoss", 0.0)
     df["PnL_rounded"] = df["PnL"].round(2)
     df["PnL_stats"] = df["PnL_rounded"]
     if "TradeType" in df.columns:
@@ -712,14 +718,18 @@ def main():
             matched_pairs["Side"] = matched_pairs["LiveIdx"].map(live_sel["Side"])
             matched_pairs["OpenDT_Live"] = matched_pairs["LiveIdx"].map(live_sel["OpenDT"])
             matched_pairs["OpenDT_Back"] = matched_pairs["BackIdx"].map(back_sel["OpenDT"])
-            matched_pairs["LivePnL"] = matched_pairs["LiveIdx"].map(live_sel["PnL_rounded"])
-            matched_pairs["BackPnL"] = matched_pairs["BackIdx"].map(back_sel["PnL_rounded"])
-
+            # Use unified stats PnL (net when available, else gross), then round once
+            matched_pairs["LivePnL"] = matched_pairs["LiveIdx"].map(live_sel["PnL_stats"]).round(2)
+            matched_pairs["BackPnL"] = matched_pairs["BackIdx"].map(back_sel["PnL_stats"]).round(2)
+            
         if not matches.empty:
-            opposite = matched_pairs[
-                ((matched_pairs["LivePnL"] > 0) & (matched_pairs["BackPnL"] <= 0)) |
-                ((matched_pairs["LivePnL"] <= 0) & (matched_pairs["BackPnL"] > 0))
-            ].copy()
+            EPS = 0.01  # treat +/- 1 cent as flat
+            def _sign(s):
+                return np.where(s > EPS, 1, np.where(s < -EPS, -1, 0))
+
+            matched_pairs["LiveSign"] = _sign(matched_pairs["LivePnL"])
+            matched_pairs["BackSign"] = _sign(matched_pairs["BackPnL"])
+            opposite = matched_pairs[(matched_pairs["LiveSign"] * matched_pairs["BackSign"]) == -1].copy()
         else:
             opposite = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LivePnL","BackPnL"])
 
