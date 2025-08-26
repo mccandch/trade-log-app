@@ -185,12 +185,19 @@ def load_sheets_data() -> pd.DataFrame:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Normalize Right (C/P/Call/Put variants)
+        # Normalize Right (C/P/Call/Put variants) and coerce invalids to NA
         if "Right" in df.columns:
             ser = df["Right"].astype(str).str.strip().str.upper()
-            df["Right"] = ser.replace(
-                {"CALL": "C", "CALLS": "C", "PUT": "P", "PUTS": "P", "1": "C", "2": "P"}
-            )
+            ser = ser.replace({
+                "CALL": "C", "CALLS": "C",
+                "PUT": "P", "PUTS": "P",
+                "1": "C", "2": "P",
+                "NAN": pd.NA, "NONE": pd.NA,
+                "": pd.NA, "NA": pd.NA, "N/A": pd.NA
+            })
+            # anything not C/P becomes NA
+            ser = ser.where(ser.isin(["C", "P"]), pd.NA)
+            df["Right"] = ser
         else:
             df["Right"] = pd.NA
 
@@ -274,18 +281,21 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     dfu["Premium"] = _numeric_series(dfu, ["Premium", "TotalPremium", "Premium($)"])
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
 
-    # Aggregate per strategy
     g = (
         dfu.groupby("Strategy", dropna=False)
-           .agg(
-               Premium=("Premium", "sum"),
-               PnL=("PnL", "sum"),
-                Trades=("PnL", lambda s: (s != 0).sum()),   # only count non-zero PnL
-                Winners=("PnL", lambda s: (s > 0).sum()),
-                Losers=("PnL", lambda s: (s < 0).sum()),
-           )
-           .reset_index()
+        .agg(
+            Premium=("Premium", "sum"),
+            PnL=("PnL", "sum"),
+            Trades=("PnL", lambda s: (
+                (((s != 0) | (dfu.loc[s.index, "Date"] == date.today())) &
+                    dfu.loc[s.index, "Right"].isin(["C", "P"])).sum()
+            )),
+            Winners=("PnL", lambda s: ((s > 0) & dfu.loc[s.index, "Right"].isin(["C", "P"])).sum()),
+            Losers=("PnL", lambda s: ((s < 0) & dfu.loc[s.index, "Right"].isin(["C", "P"])).sum()),
+        )
+        .reset_index()
     )
+
 
     # Derived metrics
     g["PCR"] = np.where(g["Premium"] != 0, (g["PnL"] / g["Premium"]) * 100.0, np.nan)
@@ -378,10 +388,17 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     total_pnl_val = float(pnl_series.sum())
     pcr_pct       = _pcr(total_pnl_val, float(prem_series.sum()))
 
-    wins   = int((pnl_series > 0).sum())
-    losses = int((pnl_series < 0).sum())
-    denom  = wins + losses
-    win_rate_pct = (wins / denom) * 100.0 if denom > 0 else 0.0
+    today = date.today()
+    is_today = (df_user["Date"] == today)
+
+    valid_mask = df_user["Right"].isin(["C", "P"])
+
+    wins   = int(((pnl_series > 0) & valid_mask).sum())
+    losses = int(((pnl_series < 0) & valid_mask).sum())
+    breakevens_today = int(((pnl_series == 0) & is_today & valid_mask).sum())
+
+    trades = wins + losses + breakevens_today
+    win_rate_pct = (wins / trades) * 100.0 if trades > 0 else 0.0
 
     _user_header(name=user, pcr_pct=pcr_pct, win_rate_pct=win_rate_pct, total_pnl=total_pnl_val)
 
@@ -581,9 +598,10 @@ def daily_compare_tab():
         with col:
             df_user = view[view["User"] == user].copy()
             picked_strats = render_user_table_with_toggles(user, df_user)
-            if picked_strats:
-                trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
-                render_trades_table(trades, title=f"{user} — selected strategy trades")
+        if picked_strats:
+            trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
+            trades = trades[trades["Right"].isin(["C", "P"])]
+            render_trades_table(trades, title=f"{user} — selected strategy trades")
 
     # Global Strategy breakdown (selected range)
     st.divider()
@@ -593,14 +611,38 @@ def daily_compare_tab():
     df_view["PnL"] = _numeric_series(df_view, ["PnL", "ProfitLoss", "P/L", "PL"])
 
     stats = (
-        df_view.groupby(["User", "Strategy"], dropna=False)[["Premium", "PnL"]]
-        .sum()
+        df_view.groupby(["User", "Strategy"], dropna=False)
+        .agg(
+            Premium=("Premium", "sum"),
+            PnL=("PnL", "sum"),
+
+            Trades=("PnL", lambda s: (
+                (
+                    ((s != 0) | (df_view.loc[s.index, "Date"] == date.today())) &
+                    df_view.loc[s.index, "Right"].isin(["C", "P"])
+                ).sum()
+            )),
+            Winners=("PnL", lambda s: (
+                ((s > 0) & df_view.loc[s.index, "Right"].isin(["C", "P"])).sum()
+            )),
+            Losers=("PnL", lambda s: (
+                ((s < 0) & df_view.loc[s.index, "Right"].isin(["C", "P"])).sum()
+            )),
+        )
         .reset_index()
     )
+
+    # PCR %
     stats["PCR %"] = np.where(
         stats["Premium"] != 0, (stats["PnL"] / stats["Premium"]) * 100.0, np.nan
     )
-    stats = stats[["User", "Strategy", "PCR %", "Premium", "PnL"]]
+
+    # Win % (only non-zero outcomes)
+    denom = stats["Winners"] + stats["Losers"]
+    stats["Win %"] = np.where(denom > 0, (stats["Winners"] / denom) * 100.0, np.nan)
+
+    # Final order
+    stats = stats[["User", "Strategy", "PCR %", "Win %", "Trades", "Winners", "Losers", "Premium", "PnL"]]
 
     st.subheader("Strategy breakdown (selected range)")
     _df_no_index(stats)
