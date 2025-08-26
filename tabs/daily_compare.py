@@ -280,9 +280,9 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
            .agg(
                Premium=("Premium", "sum"),
                PnL=("PnL", "sum"),
-               Trades=("PnL", "count"),           # count of rows with non-null PnL
-               Winners=("PnL", lambda s: (s > 0).sum()),
-               Losers=("PnL", lambda s: (s < 0).sum()),
+                Trades=("PnL", lambda s: (s != 0).sum()),   # only count non-zero PnL
+                Winners=("PnL", lambda s: (s > 0).sum()),
+                Losers=("PnL", lambda s: (s < 0).sum()),
            )
            .reset_index()
     )
