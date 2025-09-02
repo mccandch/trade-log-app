@@ -12,6 +12,8 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
+from typing import Optional, Union, BinaryIO
+import altair as alt
 
 
 # =========================
@@ -377,6 +379,60 @@ def render_trades_table(trades: pd.DataFrame, title: str):
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
+def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
+    """
+    Interactive line chart of *daily* cumulative PnL.
+    One point per calendar day:
+      1) Sum PnL within each day
+      2) Plot cumulative sum across days
+    Requires DateTime + PnL columns.
+    """
+    if trades.empty or "DateTime" not in trades.columns or "PnL" not in trades.columns:
+        st.caption("No time series to chart.")
+        return
+
+    df = trades.copy()
+    # Normalize types
+    df["Entry time"] = pd.to_datetime(df["DateTime"], errors="coerce")
+    df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["Entry time"])
+
+    if df.empty:
+        st.caption("No time series to chart.")
+        return
+
+    # ---- DAILY ROLLUP ----
+    # Convert to calendar day and sum PnL per day
+    df["Day"] = df["Entry time"].dt.normalize()  # midnight of that day (keeps tz if present)
+    daily = (
+        df.groupby("Day", as_index=False)["PnL"]
+          .sum()
+          .sort_values("Day")
+    )
+    daily["CumPnL"] = daily["PnL"].cumsum()
+
+    if daily.empty:
+        st.caption("No time series to chart.")
+        return
+
+    line = (
+        alt.Chart(daily)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("Day:T", title="Day"),
+            y=alt.Y("CumPnL:Q", title="Cumulative PnL ($)"),
+            tooltip=[
+                alt.Tooltip("Day:T", title="Day"),
+                alt.Tooltip("PnL:Q", title="Daily PnL ($)", format=",.2f"),
+                alt.Tooltip("CumPnL:Q", title="Cum PnL ($)", format=",.2f"),
+            ],
+        )
+        .interactive()
+        .properties(height=260, title=title)
+    )
+
+    st.altair_chart(line, use_container_width=True)
+
 # ===================================
 # AG Grid: per-user strategy selector
 # ===================================
@@ -593,15 +649,42 @@ def daily_compare_tab():
         st.warning("Nobody placed any trades for the selected date range.")
         st.stop()  # or return
 
-    cols = st.columns(len(ordered_users))
-    for col, user in zip(cols, ordered_users):
-        with col:
-            df_user = view[view["User"] == user].copy()
-            picked_strats = render_user_table_with_toggles(user, df_user)
-        if picked_strats:
-            trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
-            trades = trades[trades["Right"].isin(["C", "P"])]
-            render_trades_table(trades, title=f"{user} — selected strategy trades")
+    try:
+        users  # if it already exists, use it
+    except NameError:
+        users = list(view["User"].dropna().unique())
+
+    if not users:
+        st.caption("No users in this date range.")
+    else:
+        cols = st.columns(len(users))
+        for col, user in zip(cols, users):
+            with col:
+                df_user = view[view["User"] == user].copy()
+                picked_strats = render_user_table_with_toggles(user, df_user)
+
+                # Build the trades set used for the table/chart
+                if picked_strats:
+                    # User has picked strategies -> filter to those
+                    trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
+                else:
+                    # Nothing picked yet -> behave like "all strategies" are selected (for the chart)
+                    trades = df_user.copy()
+
+                # Keep only option trades and render table/chart
+                trades = trades[trades["Right"].isin(["C", "P"])]
+
+                if picked_strats:
+                    # Only show the trade table once the user actually selects strategies
+                    render_trades_table(trades, title=f"{user} — selected strategy trades")
+                else:
+                    st.caption("No strategy selected — showing PnL for **all strategies** until you pick some.")
+
+                # Interactive PnL line chart (works whether or not anything is selected)
+                if not trades.empty:
+                    _pnl_line_chart(trades, title=f"{user} — PnL over time")
+                else:
+                    st.caption("No trades to chart.")
 
     # Global Strategy breakdown (selected range)
     st.divider()

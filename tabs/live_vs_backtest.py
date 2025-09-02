@@ -100,12 +100,24 @@ def lvb_read_csv_file(uploaded) -> pd.DataFrame:
 
 def lvb_persist_upload_bytes(file_obj, state_key: str):
     if file_obj is not None:
+        # Handle raw bytes first to avoid .seek on bytes
+        if isinstance(file_obj, (bytes, bytearray, memoryview)):
+            st.session_state[state_key] = bytes(file_obj)
+            return io.BytesIO(st.session_state[state_key])
+
+        # Try UploadedFile.getvalue(); if not available, fall back to read()
         try:
             st.session_state[state_key] = file_obj.getvalue()
         except Exception:
-            file_obj.seek(0)
+            if hasattr(file_obj, "seek"):
+                try:
+                    file_obj.seek(0)
+                except Exception:
+                    pass
             st.session_state[state_key] = file_obj.read()
         return io.BytesIO(st.session_state[state_key])
+
+    # Nothing new passed in—reuse previously stored bytes if present
     if state_key in st.session_state:
         return io.BytesIO(st.session_state[state_key])
     return None
