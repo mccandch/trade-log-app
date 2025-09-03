@@ -657,30 +657,44 @@ def daily_compare_tab():
     if not users:
         st.caption("No users in this date range.")
     else:
+        # --- PASS 1: show headers + strategy grids, and collect per-user trades ---
+        user_data = []  # list of tuples: (user, trades_df, has_selection)
+
         cols = st.columns(len(users))
         for col, user in zip(cols, users):
             with col:
                 df_user = view[view["User"] == user].copy()
                 picked_strats = render_user_table_with_toggles(user, df_user)
 
-                # Build the trades set used for the table/chart
+                # Build the trades set used later (table + chart)
                 if picked_strats:
-                    # User has picked strategies -> filter to those
                     trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
+                    has_selection = True
                 else:
-                    # Nothing picked yet -> behave like "all strategies" are selected (for the chart)
+                    # Nothing picked yet -> don’t filter strategies; we’ll still chart all
                     trades = df_user.copy()
+                    has_selection = False
 
-                # Keep only option trades and render table/chart
+                # Keep only option trades
                 trades = trades[trades["Right"].isin(["C", "P"])]
+                user_data.append((user, trades, has_selection))
 
-                if picked_strats:
-                    # Only show the trade table once the user actually selects strategies
-                    render_trades_table(trades, title=f"{user} — selected strategy trades")
+        # --- PASS 2: trade tables (aligned across columns) ---
+        cols = st.columns(len(users))
+        for col, (user, trades, has_selection) in zip(cols, user_data):
+            with col:
+                if has_selection:
+                    if not trades.empty:
+                        render_trades_table(trades, title=f"{user} — selected strategy trades")
+                    else:
+                        st.caption("No trades to show for the selected strategies.")
                 else:
-                    st.caption("No strategy selected — showing PnL for **all strategies** until you pick some.")
+                    st.caption("Select strategies above to show the trade table.")
 
-                # Interactive PnL line chart (works whether or not anything is selected)
+        # --- PASS 3: charts (also aligned across columns) ---
+        cols = st.columns(len(users))
+        for col, (user, trades, _has_selection) in zip(cols, user_data):
+            with col:
                 if not trades.empty:
                     _pnl_line_chart(trades, title=f"{user} — PnL over time")
                 else:
