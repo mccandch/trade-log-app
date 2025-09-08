@@ -311,7 +311,7 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     for c in ("Trades", "Winners", "Losers"):
         g[c] = g[c].fillna(0).astype(int)
 
-    return g[["Strategy", "PCR", "WinRate", "Trades", "Winners", "Losers"]]
+    return g[["Strategy", "Premium", "PCR", "WinRate", "Trades", "Winners", "Losers"]]
 
 
 def render_trades_table(trades: pd.DataFrame, title: str):
@@ -472,7 +472,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     stats["PnL"] = stats["Canonical"].map(pnl_map).fillna(0.0)
 
     # Table for the grid
-    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Trades", "Winners", "Losers", "PnL"]]
+    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]]
 
     # AG Grid config
     gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
@@ -506,6 +506,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     gb.configure_column("Strategy", headerClass="dc-center")
     gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Premium", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
     gb.configure_column("Trades", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
     gb.configure_column("Winners", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
     gb.configure_column("Losers", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
@@ -699,47 +700,5 @@ def daily_compare_tab():
                     _pnl_line_chart(trades, title=f"{user} — PnL over time")
                 else:
                     st.caption("No trades to chart.")
-
-    # Global Strategy breakdown (selected range)
-    st.divider()
-
-    df_view = view.copy()
-    df_view["Premium"] = _numeric_series(df_view, ["Premium", "TotalPremium", "Premium($)"])
-    df_view["PnL"] = _numeric_series(df_view, ["PnL", "ProfitLoss", "P/L", "PL"])
-
-    stats = (
-        df_view.groupby(["User", "Strategy"], dropna=False)
-        .agg(
-            Premium=("Premium", "sum"),
-            PnL=("PnL", "sum"),
-
-            Trades=("PnL", lambda s: (
-                (
-                    ((s != 0) | (df_view.loc[s.index, "Date"] == date.today())) &
-                    df_view.loc[s.index, "Right"].isin(["C", "P"])
-                ).sum()
-            )),
-            Winners=("PnL", lambda s: (
-                ((s > 0) & df_view.loc[s.index, "Right"].isin(["C", "P"])).sum()
-            )),
-            Losers=("PnL", lambda s: (
-                ((s < 0) & df_view.loc[s.index, "Right"].isin(["C", "P"])).sum()
-            )),
-        )
-        .reset_index()
-    )
-
-    # PCR %
-    stats["PCR %"] = np.where(
-        stats["Premium"] != 0, (stats["PnL"] / stats["Premium"]) * 100.0, np.nan
-    )
-
-    # Win % (only non-zero outcomes)
-    denom = stats["Winners"] + stats["Losers"]
-    stats["Win %"] = np.where(denom > 0, (stats["Winners"] / denom) * 100.0, np.nan)
-
-    # Final order
-    stats = stats[["User", "Strategy", "PCR %", "Win %", "Trades", "Winners", "Losers", "Premium", "PnL"]]
-
-    st.subheader("Strategy breakdown (selected range)")
-    _df_no_index(stats)
+    # (Dropped duplicate breakdown table per user request)
+    return
