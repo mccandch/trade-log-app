@@ -650,13 +650,15 @@ def daily_compare_tab():
         st.warning("Nobody placed any trades for the selected date range.")
         st.stop()  # or return
 
-    try:
-        users  # if it already exists, use it
-    except NameError:
-        users = list(view["User"].dropna().unique())
+    # --- User filter (default: show all users in the current view) ---
+    users = st.multiselect(
+        "Users to display", options=ordered_users, default=ordered_users, key="dc_user_filter"
+    )
 
     if not users:
-        st.caption("No users in this date range.")
+        st.caption("No users selected.")
+        return
+
     else:
         # --- PASS 1: show headers + strategy grids, and collect per-user trades ---
         user_data = []  # list of tuples: (user, trades_df, has_selection)
