@@ -536,6 +536,14 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     # Remember selection
     sel_key = f"dc_sel_{user}"
 
+    # --- If there are no strategies, show a note and return nothing to select ---
+    if stats_for_grid.empty:
+        st.caption("No strategies found for this user in the selected date range.")
+        return []
+
+    # Remember selection
+    sel_key = f"dc_sel_{user}"
+
     grid = AgGrid(
         stats_for_grid,
         gridOptions=go,
@@ -543,9 +551,43 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
+        key=f"dc_grid_{user}",  # unique key per user column
     )
 
-    picked_aliases = [r["Strategy"] for r in grid["selected_rows"]]
+    # --- Robust selection extraction across st-aggrid versions ---
+    def _extract_selected_rows(g):
+        rows = None
+
+        # Case 1: dict-style (most common)
+        if isinstance(g, dict):
+            rows = g.get("selected_rows", None)
+            if rows is None:
+                rows = g.get("selectedRows", None)
+
+        # Case 2: object-style attributes (some versions wrap response)
+        if rows is None:
+            try:
+                rows = getattr(g, "selected_rows", None)
+                if rows is None:
+                    rows = getattr(g, "selectedRows", None)
+            except Exception:
+                rows = None
+
+        # Normalize to list[dict]
+        if rows is None:
+            return []
+        if isinstance(rows, pd.DataFrame):
+            return rows.to_dict("records")
+        if isinstance(rows, list):
+            return rows
+        return []
+
+    selected_rows = _extract_selected_rows(grid)
+
+    # Convert to strategy aliases from the grid
+    picked_aliases = [r.get("Strategy") for r in selected_rows if isinstance(r, dict) and r.get("Strategy")]
+
+    # Persist for next rerun
     st.session_state[sel_key] = picked_aliases
 
     # Map back to canonical names for filtering trades
