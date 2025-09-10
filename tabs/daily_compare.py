@@ -140,9 +140,11 @@ def open_sheet():
 
 @st.cache_data(ttl=60)
 def load_sheets_data() -> pd.DataFrame:
-    """Read Raw_* tabs and normalize columns for the app."""
+    """Read Raw_* tabs and normalize columns for the app, with a brief stability check."""
+    import time
+    import pandas as pd
+
     sh = open_sheet()
-    frames = []
 
     def _rename_cols(df: pd.DataFrame) -> pd.DataFrame:
         rename_map = {}
@@ -156,64 +158,96 @@ def load_sheets_data() -> pd.DataFrame:
                 rename_map[c] = "Source"
         return df.rename(columns=rename_map) if rename_map else df
 
-    for ws in sh.worksheets():
-        title = ws.title or ""
-        if not title.startswith("Raw_"):
-            continue
+    # --- one pass over all Raw_* tabs, returning a list of normalized frames ---
+    def _read_all_raw_tabs() -> list[pd.DataFrame]:
+        frames: list[pd.DataFrame] = []
+        for ws in sh.worksheets():
+            title = ws.title or ""
+            if not title.startswith("Raw_"):
+                continue
 
-        df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how="all")
-        if df.empty:
-            continue
+            df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how="all")
+            if df.empty:
+                continue
 
-        df = _rename_cols(df)
+            df = _rename_cols(df)
 
-        # Ensure we have a User value; if missing, derive from tab name (Raw_<user>)
-        if "User" not in df.columns or df["User"].isna().all():
-            df["User"] = title.replace("Raw_", "", 1)
+            # Ensure User
+            if "User" not in df.columns or df["User"].isna().all():
+                df["User"] = title.replace("Raw_", "", 1)
 
-        # Build a single DateTime from whatever we have
-        if "DateTime" in df.columns:
-            dt = pd.to_datetime(df["DateTime"], errors="coerce")
-        elif "Date" in df.columns:
-            dt = pd.to_datetime(df["Date"], errors="coerce")
-        else:
-            dt = pd.to_datetime(pd.Series([pd.NaT] * len(df)), errors="coerce")
+            # Build DateTime / Date
+            if "DateTime" in df.columns:
+                dt = pd.to_datetime(df["DateTime"], errors="coerce")
+            elif "Date" in df.columns:
+                dt = pd.to_datetime(df["Date"], errors="coerce")
+            else:
+                dt = pd.to_datetime(pd.Series([pd.NaT] * len(df)), errors="coerce")
 
-        df["DateTime"] = dt
-        df["Date"] = dt.dt.date
+            df["DateTime"] = dt
+            df["Date"] = dt.dt.date
 
-        # Numeric fields
-        for col in ("Premium", "PnL", "Strike"):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Numeric fields
+            for col in ("Premium", "PnL", "Strike"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Normalize Right (C/P/Call/Put variants) and coerce invalids to NA
-        if "Right" in df.columns:
-            ser = df["Right"].astype(str).str.strip().str.upper()
-            ser = ser.replace({
-                "CALL": "C", "CALLS": "C",
-                "PUT": "P", "PUTS": "P",
-                "1": "C", "2": "P",
-                "NAN": pd.NA, "NONE": pd.NA,
-                "": pd.NA, "NA": pd.NA, "N/A": pd.NA
-            })
-            # anything not C/P becomes NA
-            ser = ser.where(ser.isin(["C", "P"]), pd.NA)
-            df["Right"] = ser
-        else:
-            df["Right"] = pd.NA
+            # Normalize Right to {C,P,NA}
+            if "Right" in df.columns:
+                ser = df["Right"].astype(str).str.strip().str.upper()
+                ser = ser.replace({
+                    "CALL": "C", "CALLS": "C",
+                    "PUT": "P", "PUTS": "P",
+                    "1": "C", "2": "P",
+                    "NAN": pd.NA, "NONE": pd.NA,
+                    "": pd.NA, "NA": pd.NA, "N/A": pd.NA
+                })
+                ser = ser.where(ser.isin(["C", "P"]), pd.NA)
+                df["Right"] = ser
+            else:
+                df["Right"] = pd.NA
 
-        keep = [
-            "User", "Date", "DateTime", "Strategy", "Right", "Strike",
-            "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
-        ]
-        cols = [c for c in keep if c in df.columns]
-        out = df[cols].copy()
+            keep = [
+                "User", "Date", "DateTime", "Strategy", "Right", "Strike",
+                "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
+            ]
+            cols = [c for c in keep if c in df.columns]
+            out = df[cols].copy()
 
-        out["__source_tab"] = title  # helpful for debugging
-        frames.append(out)
+            out["__source_tab"] = title
+            frames.append(out)
+        return frames
 
-    if not frames:
+    # For stability, compare (rowcount, sum Premium, sum PnL) per tab across two reads
+    def _signature(frames: list[pd.DataFrame]) -> list[tuple]:
+        sig = []
+        for f in frames:
+            tab = str(f["__source_tab"].iloc[0]) if not f.empty and "__source_tab" in f.columns else ""
+            prem = float(pd.to_numeric(f.get("Premium", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "Premium" in f.columns else 0.0
+            pnl  = float(pd.to_numeric(f.get("PnL", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "PnL" in f.columns else 0.0
+            sig.append((tab, len(f), round(prem, 2), round(pnl, 2)))
+        # sort to make ordering irrelevant
+        sig.sort(key=lambda x: x[0])
+        return sig
+
+    # --- stability retry loop: read -> brief pause -> read again and compare ---
+    frames_final: list[pd.DataFrame] = []
+    last_frames: list[pd.DataFrame] = []
+    for attempt in range(5):
+        f1 = _read_all_raw_tabs()
+        sig1 = _signature(f1)
+        time.sleep(0.7)  # small pause to avoid catching a mid-write snapshot
+        f2 = _read_all_raw_tabs()
+        sig2 = _signature(f2)
+
+        if sig1 == sig2:
+            frames_final = f2
+            break
+        last_frames = f2  # keep the most recent in case we never stabilize
+    else:
+        frames_final = last_frames
+
+    if not frames_final:
         return pd.DataFrame(
             columns=[
                 "User", "Date", "DateTime", "Strategy", "Right", "Strike",
@@ -222,7 +256,7 @@ def load_sheets_data() -> pd.DataFrame:
             ]
         )
 
-    return pd.concat(frames, ignore_index=True)
+    return pd.concat(frames_final, ignore_index=True)
 
 
 # ========================
@@ -441,45 +475,53 @@ def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
 # AG Grid: per-user strategy selector
 # ===================================
 def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
-    # overall badge
-    prem_series = _numeric_series(df_user, ["Premium", "TotalPremium", "Premium($)"])
-    pnl_series  = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
-
-    total_pnl_val = float(pnl_series.sum())
-    total_prem_val  = float(prem_series.sum())
-    pcr_pct       = _pcr(total_pnl_val, float(prem_series.sum()))
-
-    today = date.today()
-    is_today = (df_user["Date"] == today)
-
-    valid_mask = df_user["Right"].isin(["C", "P"])
-
-    wins   = int(((pnl_series > 0) & valid_mask).sum())
-    losses = int(((pnl_series < 0) & valid_mask).sum())
-    breakevens_today = int(((pnl_series == 0) & is_today & valid_mask).sum())
-
-    trades = wins + losses + breakevens_today
-    win_rate_pct = (wins / trades) * 100.0 if trades > 0 else 0.0
-
-    _user_header(name=user, pcr_pct=pcr_pct, win_rate_pct=win_rate_pct, total_pnl=total_pnl_val,total_premium=total_prem_val)
-
-    # Per-strategy stats (PCR, Win%, counts)
-    stats = _user_strategy_pcr(df_user).copy()  # columns: Strategy, PCR, WinRate, Trades, Winners, Losers
+    # ---- Build per-strategy stats FIRST (so we can safely summarize for the header) ----
+    stats = _user_strategy_pcr(df_user).copy()  # columns: Strategy, Premium, PCR, WinRate, Trades, Winners, Losers
     stats.rename(columns={"Strategy": "Canonical"}, inplace=True)
     stats["Strategy"] = stats["Canonical"].map(lambda s: ALIAS.get(s, s))
     stats["PCR %"] = stats["PCR"].round(1)
     stats["Win %"] = stats["WinRate"].round(1)
 
-    # PnL mapped by canonical strategy key (prevents misalignment)
+    # Map PnL by canonical key (prevents misalignment)
     dfu = df_user.copy()
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
     pnl_map = dfu.groupby("Strategy", dropna=False)["PnL"].sum().to_dict()
+
     stats["PnL"] = stats["Canonical"].map(pnl_map).fillna(0.0)
 
-    # Table for the grid
-    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]]
+    # Table consumed by AG Grid
+    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
 
-    # AG Grid config
+    # ---- Compute header/badge values from the table the user sees ----
+    if stats_for_grid.empty:
+        visible_pnl = 0.0
+        visible_prem = 0.0
+        total_wins = 0
+        total_losses = 0
+    else:
+        visible_pnl  = float(pd.to_numeric(stats_for_grid["PnL"], errors="coerce").fillna(0).sum())
+        visible_prem = float(pd.to_numeric(stats_for_grid["Premium"], errors="coerce").fillna(0).sum())
+        total_wins   = int(pd.to_numeric(stats_for_grid["Winners"], errors="coerce").fillna(0).sum())
+        total_losses = int(pd.to_numeric(stats_for_grid["Losers"],  errors="coerce").fillna(0).sum())
+
+    trade_denom   = total_wins + total_losses
+    visible_winrt = (total_wins / trade_denom) * 100.0 if trade_denom > 0 else 0.0
+    visible_pcr   = _pcr(visible_pnl, visible_prem)
+
+    _user_header(
+        name=user,
+        pcr_pct=visible_pcr,
+        win_rate_pct=visible_winrt,
+        total_pnl=visible_pnl,
+        total_premium=visible_prem,
+    )
+
+    # If there are no strategies, show a note and return nothing to select
+    if stats_for_grid.empty:
+        st.caption("No strategies found for this user in the selected date range.")
+        return []
+
+    # ---- AG Grid config ----
     gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
     gb.configure_selection("multiple", use_checkbox=True)
     gb.configure_default_column(cellStyle={"textAlign": "center"})
@@ -517,7 +559,6 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     gb.configure_column("Losers", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
     gb.configure_column("PnL", header_name="PnL", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
 
-    # Row color by PCR
     row_style = JsCode("""
       function(params){
         const v = Number(params.data["PCR %"]);
@@ -538,17 +579,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
       }
     """)
 
-    # Remember selection
-    sel_key = f"dc_sel_{user}"
-
-    # --- If there are no strategies, show a note and return nothing to select ---
-    if stats_for_grid.empty:
-        st.caption("No strategies found for this user in the selected date range.")
-        return []
-
-    # Remember selection
-    sel_key = f"dc_sel_{user}"
-
+    # Render grid
     grid = AgGrid(
         stats_for_grid,
         gridOptions=go,
@@ -556,29 +587,19 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        key=f"dc_grid_{user}",  # unique key per user column
+        key=f"dc_grid_{user}",
     )
 
-    # --- Robust selection extraction across st-aggrid versions ---
+    # Robust selection extraction
     def _extract_selected_rows(g):
         rows = None
-
-        # Case 1: dict-style (most common)
         if isinstance(g, dict):
-            rows = g.get("selected_rows", None)
-            if rows is None:
-                rows = g.get("selectedRows", None)
-
-        # Case 2: object-style attributes (some versions wrap response)
+            rows = g.get("selected_rows") or g.get("selectedRows")
         if rows is None:
             try:
-                rows = getattr(g, "selected_rows", None)
-                if rows is None:
-                    rows = getattr(g, "selectedRows", None)
+                rows = getattr(g, "selected_rows", None) or getattr(g, "selectedRows", None)
             except Exception:
                 rows = None
-
-        # Normalize to list[dict]
         if rows is None:
             return []
         if isinstance(rows, pd.DataFrame):
@@ -588,14 +609,12 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         return []
 
     selected_rows = _extract_selected_rows(grid)
-
-    # Convert to strategy aliases from the grid
     picked_aliases = [r.get("Strategy") for r in selected_rows if isinstance(r, dict) and r.get("Strategy")]
 
     # Persist for next rerun
-    st.session_state[sel_key] = picked_aliases
+    st.session_state[f"dc_sel_{user}"] = picked_aliases
 
-    # Map back to canonical names for filtering trades
+    # Map back to canonical names
     rev_alias = {v: k for k, v in ALIAS.items()}
     return [rev_alias.get(a, a) for a in picked_aliases]
 
