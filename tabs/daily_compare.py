@@ -63,8 +63,8 @@ def _aggrid_css() -> None:
     )
 
 
-def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: float) -> None:
-    """Render 'Name  [PCR: ±X.X% | Win Rate: X.X% | $±N]' with table-matching colors."""
+def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: float, total_premium: float = 0.0) -> None:
+    """Render 'Name  [PCR: ±X.X% | Win Rate: X.X% | Premium $X,XXX | $±N]' with table-matching colors."""
     # Match the same green/red as your grid rows
     if pcr_pct > 0:
         txt_color, bg = "#ffffff", "#143d2b"   # green
@@ -74,9 +74,10 @@ def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: floa
         txt_color, bg = "#ffffff", "rgba(148,163,184,0.12)"  # gray
 
     # Format parts
-    pcr_str  = f"{pcr_pct:+.1f}%"                     # include sign; change to abs if you prefer no sign
-    win_str  = f"{win_rate_pct:.1f}%"
-    pnl_str  = f"${abs(total_pnl):,.2f}"
+    pcr_str     = f"{pcr_pct:+.1f}%"
+    win_str     = f"{win_rate_pct:.1f}%"
+    premium_str = f"Premium ${abs(float(total_premium)):,.0f}"   # <- no cents: $x,xxx
+    pnl_str     = f"${abs(float(total_pnl)):,.2f}"
     if total_pnl < 0:
         pnl_str = f"-{pnl_str}"
 
@@ -92,13 +93,12 @@ def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: floa
             color:{txt_color} !important;background:{bg};
             border:1px solid rgba(255,255,255,0.06);
           ">
-            PCR: {pcr_str} &nbsp;|&nbsp; Win Rate: {win_str} &nbsp;|&nbsp; {pnl_str}
+            PCR: {pcr_str} &nbsp;|&nbsp; Win Rate: {win_str} &nbsp;|&nbsp; {premium_str} &nbsp;|&nbsp; {pnl_str}
           </span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
 
 # =================
 # Utility functions
@@ -446,6 +446,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     pnl_series  = _numeric_series(df_user, ["PnL", "ProfitLoss", "P/L", "PL"])
 
     total_pnl_val = float(pnl_series.sum())
+    total_prem_val  = float(prem_series.sum())
     pcr_pct       = _pcr(total_pnl_val, float(prem_series.sum()))
 
     today = date.today()
@@ -460,7 +461,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     trades = wins + losses + breakevens_today
     win_rate_pct = (wins / trades) * 100.0 if trades > 0 else 0.0
 
-    _user_header(name=user, pcr_pct=pcr_pct, win_rate_pct=win_rate_pct, total_pnl=total_pnl_val)
+    _user_header(name=user, pcr_pct=pcr_pct, win_rate_pct=win_rate_pct, total_pnl=total_pnl_val,total_premium=total_prem_val)
 
     # Per-strategy stats (PCR, Win%, counts)
     stats = _user_strategy_pcr(df_user).copy()  # columns: Strategy, PCR, WinRate, Trades, Winners, Losers
