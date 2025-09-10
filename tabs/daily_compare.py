@@ -336,6 +336,10 @@ def render_trades_table(trades: pd.DataFrame, title: str):
 
     cols += [c for c in ["Strategy"] if c in trades.columns]
 
+    if "Premium" in trades.columns:
+        trades["Premium"] = pd.to_numeric(trades["Premium"], errors="coerce")
+        cols.append("Premium")
+
     if "PnL" in trades.columns:
         trades["PnL"] = pd.to_numeric(trades["PnL"], errors="coerce")
         cols.append("PnL")
@@ -370,7 +374,7 @@ def render_trades_table(trades: pd.DataFrame, title: str):
     styled = (
         view.style
         .apply(_row_style, axis=1)
-        .format({"Entry time": _fmt_time, "PnL": _fmt_money}, na_rep="")
+        .format({"Entry time": _fmt_time,"Premium": _fmt_money, "PnL": _fmt_money}, na_rep="")
         .set_table_attributes('class="compact-table"')
         .hide(axis="index")
         .set_properties(**{"text-align": "center"})
