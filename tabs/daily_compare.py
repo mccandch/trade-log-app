@@ -642,22 +642,41 @@ def daily_compare_tab():
         st.info("No data found yet. Start your watchers (Raw_* tabs) and click Refresh.")
         return
 
-    # Date range presets
+    # ---- Date range presets & state bootstrap ----
     min_date, max_date = df["Date"].min(), df["Date"].max()
-
-    # Initialize once, keep Session State as the single source of truth
     default_range = (max_date, max_date)
+
+    # single source of truth
     st.session_state.setdefault("dc_date_range", default_range)
+
+    # bootstrap the individual pickers exactly once
+    if "dc_start_date" not in st.session_state or "dc_end_date" not in st.session_state:
+        s, e = st.session_state["dc_date_range"]
+        st.session_state["dc_start_date"] = max(min(s, max_date), min_date)
+        st.session_state["dc_end_date"]   = max(min(e, max_date), min_date)
 
     def clamp(d: date) -> date:
         return max(min(d, max_date), min_date)
 
     def set_range(start: date, end: date):
-        st.session_state["dc_date_range"] = (clamp(start), clamp(end))
-        # also push into individual pickers so they reflect preset changes
-        st.session_state["dc_start_date"] = clamp(start)
-        st.session_state["dc_end_date"]   = clamp(end)
+        """Used by preset buttons; updates both pickers + range, then reruns."""
+        start = clamp(start); end = clamp(end)
+        st.session_state["dc_start_date"] = start
+        st.session_state["dc_end_date"]   = end
+        st.session_state["dc_date_range"] = (start, end)
         _rerun()
+
+    def _sync_and_normalize_dates():
+        """Callback when user edits either picker."""
+        s = clamp(st.session_state["dc_start_date"])
+        e = clamp(st.session_state["dc_end_date"])
+        if s > e:
+            s, e = e, s
+            # write back the swapped values so UI reflects normalization
+            st.session_state["dc_start_date"] = s
+            st.session_state["dc_end_date"]   = e
+        st.session_state["dc_date_range"] = (s, e)
+
 
     # ---------- Preset rows ----------
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
@@ -690,39 +709,29 @@ def daily_compare_tab():
     if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
-    # ---------- Left-aligned Start/End pickers ----------
-    prev_start, prev_end = st.session_state.get("dc_date_range", default_range)
-
-    # Narrow layout: keep both pickers small and aligned to the left
+    # ---------- Left-aligned Start/End pickers (no value=, no warnings) ----------
     c_start, c_gap, c_end, _ = st.columns([0.16, 0.02, 0.16, 0.66])
 
     with c_start:
-        start_picked = st.date_input(
+        st.date_input(
             "Start date",
-            value=st.session_state.get("dc_start_date", clamp(prev_start)),
             min_value=min_date,
             max_value=max_date,
             key="dc_start_date",
+            on_change=_sync_and_normalize_dates,
         )
 
     with c_end:
-        end_picked = st.date_input(
+        st.date_input(
             "End date",
-            value=st.session_state.get("dc_end_date", clamp(prev_end)),
             min_value=min_date,
             max_value=max_date,
             key="dc_end_date",
+            on_change=_sync_and_normalize_dates,
         )
 
-    # Clamp & normalize order
-    d1 = clamp(start_picked)
-    d2 = clamp(end_picked)
-    if d1 > d2:
-        d1, d2 = d2, d1
-
-    # Persist normalized range for the rest of the app & preset buttons
-    st.session_state["dc_date_range"] = (d1, d2)
-
+    # pull the normalized range for downstream filters
+    d1, d2 = st.session_state["dc_date_range"]
 
     # ---- Now compute the filtered view and user list (ALWAYS) ----
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
