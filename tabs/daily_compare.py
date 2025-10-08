@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from dateutil.relativedelta import relativedelta
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 import gspread
@@ -653,15 +654,24 @@ def daily_compare_tab():
 
     def set_range(start: date, end: date):
         st.session_state["dc_date_range"] = (clamp(start), clamp(end))
+        # also push into individual pickers so they reflect preset changes
+        st.session_state["dc_start_date"] = clamp(start)
+        st.session_state["dc_end_date"]   = clamp(end)
         _rerun()
 
-    r1c1, r1c2, r1c3 = st.columns(3)
+    # ---------- Preset rows ----------
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     if r1c1.button("Today", key="dc_btn_today", use_container_width=True):
         t = date.today(); set_range(t, t)
     if r1c2.button("Yesterday", key="dc_btn_yesterday", use_container_width=True):
         y = date.today() - timedelta(days=1); set_range(y, y)
     if r1c3.button("This Week", key="dc_btn_this_week", use_container_width=True):
         d0 = date.today(); start = d0 - timedelta(days=d0.weekday()); set_range(start, d0)
+    if r1c4.button("Rolling month", key="dc_btn_rolling_month", use_container_width=True):
+        # True month arithmetic: one calendar month back from today (handles 31->30/28/29 correctly)
+        d0 = date.today()
+        start = d0 - relativedelta(months=1)   # e.g., Oct 31 -> Sep 30; Oct 8 -> Sep 8
+        set_range(start, d0)
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     if r2c1.button("Last Week", key="dc_btn_last_week", use_container_width=True):
@@ -680,29 +690,39 @@ def daily_compare_tab():
     if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
-    # --- Date range widget (range mode). Do NOT pre-write to dc_date_range.
-    def clamp(d: date) -> date:
-        return max(min(d, max_date), min_date)
+    # ---------- Left-aligned Start/End pickers ----------
+    prev_start, prev_end = st.session_state.get("dc_date_range", default_range)
 
-    # --- Date range widget (range mode). Do NOT pre-write to dc_date_range.
-    prev_range = st.session_state.get("dc_date_range", (max_date, max_date))
+    # Narrow layout: keep both pickers small and aligned to the left
+    c_start, c_gap, c_end, _ = st.columns([0.16, 0.02, 0.16, 0.66])
 
-    picked = st.date_input(
-        "Date range",
-        value=prev_range,      # 2-tuple -> enables range selection UI
-        min_value=min_date,
-        max_value=max_date,
-        key="dc_date_input",   # different key than the stored range
-    )
+    with c_start:
+        start_picked = st.date_input(
+            "Start date",
+            value=st.session_state.get("dc_start_date", clamp(prev_start)),
+            min_value=min_date,
+            max_value=max_date,
+            key="dc_start_date",
+        )
 
-    # Decide d1, d2 in ALL cases
-    if isinstance(picked, (list, tuple)) and len(picked) == 2:
-        d1, d2 = map(clamp, picked)
-        st.session_state["dc_date_range"] = (d1, d2)
-    elif isinstance(picked, date):
-        d1 = d2 = clamp(picked)                 # first click
-    else:
-        d1, d2 = map(clamp, prev_range)         # fallback
+    with c_end:
+        end_picked = st.date_input(
+            "End date",
+            value=st.session_state.get("dc_end_date", clamp(prev_end)),
+            min_value=min_date,
+            max_value=max_date,
+            key="dc_end_date",
+        )
+
+    # Clamp & normalize order
+    d1 = clamp(start_picked)
+    d2 = clamp(end_picked)
+    if d1 > d2:
+        d1, d2 = d2, d1
+
+    # Persist normalized range for the rest of the app & preset buttons
+    st.session_state["dc_date_range"] = (d1, d2)
+
 
     # ---- Now compute the filtered view and user list (ALWAYS) ----
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
