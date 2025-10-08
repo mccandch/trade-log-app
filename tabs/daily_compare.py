@@ -20,6 +20,27 @@ import altair as alt
 # =========================
 # CSS helpers (runtime only)
 # =========================
+
+def _set_end_today(min_date, max_date):
+    """Callback: set End date to today, clamp to data bounds, keep range normalized."""
+    from datetime import date as _date
+
+    # clamp helper local to the callback
+    def _clamp(d):
+        return max(min(d, max_date), min_date)
+
+    t = _clamp(_date.today())
+    s = _clamp(st.session_state.get("dc_start_date", t))
+
+    # normalize order
+    if s > t:
+        s, t = t, s
+        st.session_state["dc_start_date"] = s
+
+    st.session_state["dc_end_date"] = t
+    st.session_state["dc_date_range"] = (s, t)
+
+
 def _render_ema_b_schedule(today_only: bool = True) -> None:
     """Show EMA-B time buckets. Default: only the current day."""
     day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -709,26 +730,41 @@ def daily_compare_tab():
     if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
-    # ---------- Left-aligned Start/End pickers (no value=, no warnings) ----------
+    # ---------- Left-aligned Start/End pickers ----------
     c_start, c_gap, c_end, _ = st.columns([0.16, 0.02, 0.16, 0.66])
 
     with c_start:
         st.date_input(
             "Start date",
-            min_value=min_date,
-            max_value=max_date,
+            min_value=min_date, max_value=max_date,
             key="dc_start_date",
             on_change=_sync_and_normalize_dates,
         )
 
     with c_end:
-        st.date_input(
-            "End date",
-            min_value=min_date,
-            max_value=max_date,
-            key="dc_end_date",
-            on_change=_sync_and_normalize_dates,
-        )
+        # Inside the End-date column, create a wide area for the input and a VERY small area for the button
+        # End date + tiny "today" button (~1/4 previous width), baseline-aligned
+        c_e1, c_btn = st.columns([0.985, 0.015])  # very small button column (~1.5% row width)
+
+        with c_e1:
+            st.date_input(
+                "End date",
+                min_value=min_date, max_value=max_date,
+                key="dc_end_date",
+                on_change=_sync_and_normalize_dates,  # your existing callback
+            )
+
+        with c_btn:
+            # nudge down so the button centers vertically with the input
+            st.markdown("<div style='margin-top:1.70rem'></div>", unsafe_allow_html=True)
+            st.button(
+                "",
+                key="dc_btn_today_end",
+                help="Set end date to today",
+                use_container_width=True,
+                on_click=_set_end_today,              # <- use callback
+                args=(min_date, max_date),            # <- pass bounds so no NameError
+            )
 
     # pull the normalized range for downstream filters
     d1, d2 = st.session_state["dc_date_range"]
