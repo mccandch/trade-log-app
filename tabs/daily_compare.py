@@ -1,46 +1,24 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import List
+from typing import List, Optional, Union, BinaryIO
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dateutil.relativedelta import relativedelta
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
-from typing import Optional, Union, BinaryIO
 import altair as alt
+from dateutil.relativedelta import relativedelta
 
 
 # =========================
 # CSS helpers (runtime only)
 # =========================
-
-def _set_end_today(min_date, max_date):
-    """Callback: set End date to today, clamp to data bounds, keep range normalized."""
-    from datetime import date as _date
-
-    # clamp helper local to the callback
-    def _clamp(d):
-        return max(min(d, max_date), min_date)
-
-    t = _clamp(_date.today())
-    s = _clamp(st.session_state.get("dc_start_date", t))
-
-    # normalize order
-    if s > t:
-        s, t = t, s
-        st.session_state["dc_start_date"] = s
-
-    st.session_state["dc_end_date"] = t
-    st.session_state["dc_date_range"] = (s, t)
-
-
 def _render_ema_b_schedule(today_only: bool = True) -> None:
     """Show EMA-B time buckets. Default: only the current day."""
     day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -64,8 +42,9 @@ def _df_no_index(df: pd.DataFrame):
     st.dataframe(
         df.reset_index(drop=True),
         use_container_width=True,
-        hide_index=True,   # <- this actually hides the 0,1,2 row numbers
+        hide_index=True,
     )
+
 
 def _aggrid_css() -> None:
     """Inject CSS for centered headers and tight spacing. Call at the start of the tab."""
@@ -95,10 +74,9 @@ def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: floa
     else:
         txt_color, bg = "#ffffff", "rgba(148,163,184,0.12)"  # gray
 
-    # Format parts
     pcr_str     = f"{pcr_pct:+.1f}%"
     win_str     = f"{win_rate_pct:.1f}%"
-    premium_str = f"Premium ${abs(float(total_premium)):,.0f}"   # <- no cents: $x,xxx
+    premium_str = f"Premium ${abs(float(total_premium)):,.0f}"
     pnl_str     = f"${abs(float(total_pnl)):,.2f}"
     if total_pnl < 0:
         pnl_str = f"-{pnl_str}"
@@ -122,6 +100,7 @@ def _user_header(name: str, pcr_pct: float, win_rate_pct: float, total_pnl: floa
         unsafe_allow_html=True,
     )
 
+
 # =================
 # Utility functions
 # =================
@@ -141,6 +120,22 @@ def _rerun():
         st.experimental_rerun()
     except Exception:
         st.rerun()
+
+
+# --- Modal: per-user calendar (module scope) ---
+if hasattr(st, "dialog"):
+    @st.dialog("Daily PnL Calendar", width="large")
+    def _show_calendar_modal(user, df_user, start_d, end_d):
+        st.markdown(f"**{user} — Daily PnL**")
+        chart = _calendar_chart(df_user, start_d, end_d, title="")
+        if chart is None:
+            st.caption("No data for this range.")
+        else:
+            st.altair_chart(chart, use_container_width=True)
+        st.button("Close", on_click=lambda: st.rerun())
+else:
+    def _show_calendar_modal(user, df_user, start_d, end_d):
+        st.warning("Your Streamlit version doesn’t support modals. Update to use st.dialog.")
 
 
 # ========================
@@ -164,7 +159,6 @@ def open_sheet():
 def load_sheets_data() -> pd.DataFrame:
     """Read Raw_* tabs and normalize columns for the app, with a brief stability check."""
     import time
-    import pandas as pd
 
     sh = open_sheet()
 
@@ -180,7 +174,6 @@ def load_sheets_data() -> pd.DataFrame:
                 rename_map[c] = "Source"
         return df.rename(columns=rename_map) if rename_map else df
 
-    # --- one pass over all Raw_* tabs, returning a list of normalized frames ---
     def _read_all_raw_tabs() -> list[pd.DataFrame]:
         frames: list[pd.DataFrame] = []
         for ws in sh.worksheets():
@@ -240,7 +233,7 @@ def load_sheets_data() -> pd.DataFrame:
             frames.append(out)
         return frames
 
-    # For stability, compare (rowcount, sum Premium, sum PnL) per tab across two reads
+    # Stability: compare signatures across two reads
     def _signature(frames: list[pd.DataFrame]) -> list[tuple]:
         sig = []
         for f in frames:
@@ -248,24 +241,21 @@ def load_sheets_data() -> pd.DataFrame:
             prem = float(pd.to_numeric(f.get("Premium", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "Premium" in f.columns else 0.0
             pnl  = float(pd.to_numeric(f.get("PnL", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "PnL" in f.columns else 0.0
             sig.append((tab, len(f), round(prem, 2), round(pnl, 2)))
-        # sort to make ordering irrelevant
         sig.sort(key=lambda x: x[0])
         return sig
 
-    # --- stability retry loop: read -> brief pause -> read again and compare ---
     frames_final: list[pd.DataFrame] = []
     last_frames: list[pd.DataFrame] = []
-    for attempt in range(5):
+    for _attempt in range(5):
         f1 = _read_all_raw_tabs()
         sig1 = _signature(f1)
-        time.sleep(0.7)  # small pause to avoid catching a mid-write snapshot
+        time.sleep(0.7)
         f2 = _read_all_raw_tabs()
         sig2 = _signature(f2)
-
         if sig1 == sig2:
             frames_final = f2
             break
-        last_frames = f2  # keep the most recent in case we never stabilize
+        last_frames = f2
     else:
         frames_final = last_frames
 
@@ -318,7 +308,6 @@ EMA_B_SCHEDULE = {
 }
 
 
-
 def _order_key(name: str):
     try:
         return (0, PREFERRED_ORDER.index(name))
@@ -333,7 +322,7 @@ def _pcr(pnl_sum: float, prem_sum: float) -> float:
 def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     """Return per-strategy PCR%, Win%, Trades, Winners, Losers for a single user's filtered window."""
     if df_user.empty:
-        return pd.DataFrame(columns=["Strategy", "PCR", "WinRate", "Trades", "Winners", "Losers"])  # empty shape
+        return pd.DataFrame(columns=["Strategy", "PCR", "WinRate", "Trades", "Winners", "Losers"])
 
     dfu = df_user.copy()
     dfu["Premium"] = _numeric_series(dfu, ["Premium", "TotalPremium", "Premium($)"])
@@ -354,7 +343,6 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-
     # Derived metrics
     g["PCR"] = np.where(g["Premium"] != 0, (g["PnL"] / g["Premium"]) * 100.0, np.nan)
     denom = g["Winners"] + g["Losers"]
@@ -363,7 +351,6 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     g["Strategy"] = g["Strategy"].astype(str)
     g = g.sort_values("Strategy", key=lambda s: s.map(_order_key))
 
-    # Ensure integer dtypes for count columns
     for c in ("Trades", "Winners", "Losers"):
         g[c] = g[c].fillna(0).astype(int)
 
@@ -404,9 +391,8 @@ def render_trades_table(trades: pd.DataFrame, title: str):
     if "Entry time" in view.columns:
         view = view.sort_values(by="Entry time", ascending=True, na_position="last")
 
-    # Drop the index here so IDs like 1450, 1451 don’t appear
     view = view.reset_index(drop=True)
-    # Row coloring by PnL
+
     def _row_style(row):
         try:
             val = float(row.get("PnL", 0))
@@ -426,7 +412,6 @@ def render_trades_table(trades: pd.DataFrame, title: str):
     def _fmt_money(x):
         return "" if pd.isna(x) else f"${float(x):,.2f}"
 
-
     styled = (
         view.style
         .apply(_row_style, axis=1)
@@ -441,18 +426,13 @@ def render_trades_table(trades: pd.DataFrame, title: str):
 
 def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
     """
-    Interactive line chart of *daily* cumulative PnL.
-    One point per calendar day:
-      1) Sum PnL within each day
-      2) Plot cumulative sum across days
-    Requires DateTime + PnL columns.
+    Interactive line chart of daily cumulative PnL.
     """
     if trades.empty or "DateTime" not in trades.columns or "PnL" not in trades.columns:
         st.caption("No time series to chart.")
         return
 
     df = trades.copy()
-    # Normalize types
     df["Entry time"] = pd.to_datetime(df["DateTime"], errors="coerce")
     df["PnL"] = pd.to_numeric(df["PnL"], errors="coerce").fillna(0.0)
     df = df.dropna(subset=["Entry time"])
@@ -461,9 +441,7 @@ def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
         st.caption("No time series to chart.")
         return
 
-    # ---- DAILY ROLLUP ----
-    # Convert to calendar day and sum PnL per day
-    df["Day"] = df["Entry time"].dt.normalize()  # midnight of that day (keeps tz if present)
+    df["Day"] = df["Entry time"].dt.normalize()
     daily = (
         df.groupby("Day", as_index=False)["PnL"]
           .sum()
@@ -493,28 +471,131 @@ def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
 
     st.altair_chart(line, use_container_width=True)
 
+
+# =============================
+# Calendar chart (daily PnL)
+# =============================
+def _calendar_chart(df: pd.DataFrame, start_d: date, end_d: date, title: str = "Daily PnL Calendar"):
+    import pandas as pd
+    import altair as alt
+
+    if df.empty:
+        return None
+
+    dfx = df.copy()
+
+    # Build a proper datetime "Date" column
+    if "Date" in dfx.columns:
+        dfx["Date"] = pd.to_datetime(dfx["Date"], errors="coerce")
+    elif "DateTime" in dfx.columns:
+        dfx["Date"] = pd.to_datetime(dfx["DateTime"], errors="coerce")
+    else:
+        return None  # nothing to chart
+
+    # Coerce PnL
+    dfx["PnL"] = pd.to_numeric(dfx.get("PnL", 0), errors="coerce").fillna(0.0)
+
+    # Drop rows with no date
+    dfx = dfx.dropna(subset=["Date"])
+    if dfx.empty:
+        return None
+
+    # ---- Daily rollup (robust) ----
+    dfx["Date"] = dfx["Date"].dt.normalize()
+    daily = dfx.groupby("Date", as_index=False)["PnL"].sum()
+    daily.rename(columns={"Date": "day"}, inplace=True)
+
+    # All days in selected range, keep weekends/empty days
+    all_days = pd.DataFrame({
+        "day": pd.date_range(pd.to_datetime(start_d), pd.to_datetime(end_d), freq="D")
+    })
+    cal = all_days.merge(daily, on="day", how="left")
+    cal["PnL"] = cal["PnL"].fillna(0.0)
+
+    # Calendar coords: Sunday=0..Saturday=6
+    cal["dow"] = (cal["day"].dt.weekday + 1) % 7
+    start_anchor = pd.to_datetime(start_d) - pd.to_timedelta(int((pd.to_datetime(start_d).weekday()+1) % 7), unit="D")
+    cal["week"] = ((cal["day"] - start_anchor).dt.days // 7).astype(int)
+
+    # Labels
+    def _fmt(v: float) -> str:
+        if abs(v) < 1e-9:
+            return ""
+        return f"(${abs(v):,.2f})" if v < 0 else f"${v:,.2f}"
+    cal["label"] = cal["PnL"].map(_fmt)
+    cal["has_trade"] = cal["PnL"].abs() > 1e-9
+
+    # Full day string: "Wednesday, Oct 1" (no leading zero on day)
+    cal["day_full_label"] = (
+        cal["day"].dt.strftime("%A, %b %d")
+        .str.replace(r"(\w+, \w+ )0", r"\1", regex=True)  # drop leading zero on day
+    )
+
+    day_names = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+
+    base = alt.Chart(cal).encode(
+        x=alt.X("dow:O",
+                sort=[0,1,2,3,4,5,6],
+                axis=alt.Axis(title=None, labelExpr=f'["{",".join(day_names)}"][datum.value]')),
+        y=alt.Y("week:O", axis=None, title=None)
+    )
+
+    rect = base.mark_rect(stroke="#3a3a3a", strokeWidth=1, cornerRadius=6).encode(
+        color=alt.condition(
+            alt.datum.has_trade,
+            alt.Color(
+                "PnL:Q",
+                scale=alt.Scale(
+                    domainMid=0,
+                    domain=[cal["PnL"].min(), 0, cal["PnL"].max()],
+                    range=["#4b1f1f", "#2a2a2a", "#143d2b"]
+                )
+            ),
+            alt.value("#1f1f1f")
+        ),
+        tooltip=[
+            alt.Tooltip("day:T", title="Date"),
+            alt.Tooltip("PnL:Q", title="PnL ($)", format=",.2f")
+        ]
+    )
+
+    # Top-of-cell date (centered, bold)
+    text_date_top = base.mark_text(
+        fontWeight="bold",
+        align="center",
+        baseline="top",
+        dy=6  # push down a bit from the top edge
+    ).encode(
+        text="day_full_label:N",
+        color=alt.value("#e5e7eb")
+    )
+
+    # Centered PnL text
+    text_pnl = base.mark_text(fontWeight="bold").encode(
+        text="label:N",
+        color=alt.value("#ffffff")
+    )
+
+    return (rect + text_date_top + text_pnl).properties(width=980, height=420, title=title)
+
+
 # ===================================
 # AG Grid: per-user strategy selector
 # ===================================
 def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
-    # ---- Build per-strategy stats FIRST (so we can safely summarize for the header) ----
-    stats = _user_strategy_pcr(df_user).copy()  # columns: Strategy, Premium, PCR, WinRate, Trades, Winners, Losers
+    stats = _user_strategy_pcr(df_user).copy()
     stats.rename(columns={"Strategy": "Canonical"}, inplace=True)
     stats["Strategy"] = stats["Canonical"].map(lambda s: ALIAS.get(s, s))
     stats["PCR %"] = stats["PCR"].round(1)
     stats["Win %"] = stats["WinRate"].round(1)
 
-    # Map PnL by canonical key (prevents misalignment)
     dfu = df_user.copy()
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
     pnl_map = dfu.groupby("Strategy", dropna=False)["PnL"].sum().to_dict()
-
     stats["PnL"] = stats["Canonical"].map(pnl_map).fillna(0.0)
 
-    # Table consumed by AG Grid
     stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
 
-    # ---- Compute header/badge values from the table the user sees ----
     if stats_for_grid.empty:
         visible_pnl = 0.0
         visible_prem = 0.0
@@ -538,12 +619,10 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         total_premium=visible_prem,
     )
 
-    # If there are no strategies, show a note and return nothing to select
     if stats_for_grid.empty:
         st.caption("No strategies found for this user in the selected date range.")
         return []
 
-    # ---- AG Grid config ----
     gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
     gb.configure_selection("multiple", use_checkbox=True)
     gb.configure_default_column(cellStyle={"textAlign": "center"})
@@ -601,7 +680,6 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
       }
     """)
 
-    # Render grid
     grid = AgGrid(
         stats_for_grid,
         gridOptions=go,
@@ -612,7 +690,6 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         key=f"dc_grid_{user}",
     )
 
-    # Robust selection extraction
     def _extract_selected_rows(g):
         rows = None
         if isinstance(g, dict):
@@ -633,10 +710,8 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     selected_rows = _extract_selected_rows(grid)
     picked_aliases = [r.get("Strategy") for r in selected_rows if isinstance(r, dict) and r.get("Strategy")]
 
-    # Persist for next rerun
     st.session_state[f"dc_sel_{user}"] = picked_aliases
 
-    # Map back to canonical names
     rev_alias = {v: k for k, v in ALIAS.items()}
     return [rev_alias.get(a, a) for a in picked_aliases]
 
@@ -648,12 +723,11 @@ def daily_compare_tab():
     _aggrid_css()
 
     st.subheader("Daily Compare (Google Sheets)")
-    # === EMA-B schedule panel (always visible) ===
+
     show_full = st.checkbox("EMA-B schedule: show full week", value=False, key="dc_sched_fullweek")
     _render_ema_b_schedule(today_only=not show_full)
     st.divider()
 
-    # Refresh button
     if st.button("Refresh data", key="dc_btn_refresh"):
         load_sheets_data.clear()
         _rerun()
@@ -667,10 +741,10 @@ def daily_compare_tab():
     min_date, max_date = df["Date"].min(), df["Date"].max()
     default_range = (max_date, max_date)
 
-    # single source of truth
+    # Single source of truth for the range
     st.session_state.setdefault("dc_date_range", default_range)
-
-    # bootstrap the individual pickers exactly once
+    
+    # Bootstrap the individual pickers once
     if "dc_start_date" not in st.session_state or "dc_end_date" not in st.session_state:
         s, e = st.session_state["dc_date_range"]
         st.session_state["dc_start_date"] = max(min(s, max_date), min_date)
@@ -693,11 +767,9 @@ def daily_compare_tab():
         e = clamp(st.session_state["dc_end_date"])
         if s > e:
             s, e = e, s
-            # write back the swapped values so UI reflects normalization
             st.session_state["dc_start_date"] = s
             st.session_state["dc_end_date"]   = e
         st.session_state["dc_date_range"] = (s, e)
-
 
     # ---------- Preset rows ----------
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
@@ -708,9 +780,9 @@ def daily_compare_tab():
     if r1c3.button("This Week", key="dc_btn_this_week", use_container_width=True):
         d0 = date.today(); start = d0 - timedelta(days=d0.weekday()); set_range(start, d0)
     if r1c4.button("Rolling month", key="dc_btn_rolling_month", use_container_width=True):
-        # True month arithmetic: one calendar month back from today (handles 31->30/28/29 correctly)
+        # True month arithmetic (handles 31 -> 30/28/29 correctly)
         d0 = date.today()
-        start = d0 - relativedelta(months=1)   # e.g., Oct 31 -> Sep 30; Oct 8 -> Sep 8
+        start = d0 - relativedelta(months=1)   # e.g., Oct 31 -> Sep 30; Oct 9 -> Sep 9
         set_range(start, d0)
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
@@ -741,97 +813,129 @@ def daily_compare_tab():
             on_change=_sync_and_normalize_dates,
         )
 
-    with c_end:
-        # Inside the End-date column, create a wide area for the input and a VERY small area for the button
-        # End date + tiny "today" button (~1/4 previous width), baseline-aligned
-        c_e1, c_btn = st.columns([0.985, 0.015])  # very small button column (~1.5% row width)
+    # tiny "end to today" button callback (self-contained to avoid name errors)
+    def _set_end_today(min_d, max_d):
+        from datetime import date as _date
+        def _clamp(d): return max(min(d, max_d), min_d)
+        t = _clamp(_date.today())
+        s = _clamp(st.session_state.get("dc_start_date", t))
+        if s > t:
+            s, t = t, s
+            st.session_state["dc_start_date"] = s
+        st.session_state["dc_end_date"] = t
+        st.session_state["dc_date_range"] = (s, t)
 
+    with c_end:
+        c_e1, c_btn = st.columns([0.985, 0.015])  # very small button column (~1.5% width)
         with c_e1:
             st.date_input(
                 "End date",
                 min_value=min_date, max_value=max_date,
                 key="dc_end_date",
-                on_change=_sync_and_normalize_dates,  # your existing callback
+                on_change=_sync_and_normalize_dates,
             )
-
         with c_btn:
-            # nudge down so the button centers vertically with the input
             st.markdown("<div style='margin-top:1.70rem'></div>", unsafe_allow_html=True)
-            st.button(
+            if st.button(
                 "",
                 key="dc_btn_today_end",
                 help="Set end date to today",
                 use_container_width=True,
-                on_click=_set_end_today,              # <- use callback
-                args=(min_date, max_date),            # <- pass bounds so no NameError
-            )
+                on_click=_set_end_today,
+                args=(min_date, max_date),
+            ):
+                pass
 
-    # pull the normalized range for downstream filters
+    # Pull normalized range for downstream filters
     d1, d2 = st.session_state["dc_date_range"]
 
-    # ---- Now compute the filtered view and user list (ALWAYS) ----
+    # ---- Filtered view ----
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
 
     users_in_view = view["User"].dropna().unique().tolist()
-    preferred_user_order = ["Chad", "Kelly"]
+    preferred_user_order = ["Chad", "Kelly", "Sam"]  # add a 3rd user here if desired
     ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
                     [u for u in sorted(users_in_view) if u not in preferred_user_order]
 
     if not ordered_users:
         st.warning("Nobody placed any trades for the selected date range.")
-        st.stop()  # or return
+        st.stop()
 
-    # --- User filter (default: show all users in the current view) ---
     users = st.multiselect(
         "Users to display", options=ordered_users, default=ordered_users, key="dc_user_filter"
     )
 
+    # --- Calendar popup render (right after multiselect) ---
+    df_cal = view[view["User"].isin(users)].copy() if users else view.copy()
     if not users:
         st.caption("No users selected.")
         return
 
-    else:
-        # --- PASS 1: show headers + strategy grids, and collect per-user trades ---
-        user_data = []  # list of tuples: (user, trades_df, has_selection)
+    # --- PASS 1: headers + grids; collect per-user trades ---
+    user_data = []
+    cols = st.columns(len(users))
+    for col, user in zip(cols, users):
+        with col:
+            df_user = view[view["User"] == user].copy()
 
-        cols = st.columns(len(users))
-        for col, user in zip(cols, users):
-            with col:
-                df_user = view[view["User"] == user].copy()
-                picked_strats = render_user_table_with_toggles(user, df_user)
+            # --- small per-user calendar button (toggle) ---
+            safe_key = user.replace(" ", "_").lower()
+            cal_state_key = f"dc_calendar_open_{safe_key}"
 
-                # Build the trades set used later (table + chart)
-                if picked_strats:
-                    trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
-                    has_selection = True
-                else:
-                    # Nothing picked yet -> don’t filter strategies; we’ll still chart all
-                    trades = df_user.copy()
-                    has_selection = False
+            # top-right tiny button row
+            ctl_l, ctl_r = st.columns([0.86, 0.14])
+            with ctl_r:
+                if st.button("📅", key=f"dc_btn_cal_{safe_key}", help=f"Show {user} calendar", use_container_width=True):
+                    _show_calendar_modal(user, df_user, d1, d2)  # <-- opens modal
 
-                # Keep only option trades
-                trades = trades[trades["Right"].isin(["C", "P"])]
-                user_data.append((user, trades, has_selection))
 
-        # --- PASS 2: trade tables (aligned across columns) ---
-        cols = st.columns(len(users))
-        for col, (user, trades, has_selection) in zip(cols, user_data):
-            with col:
-                if has_selection:
-                    if not trades.empty:
-                        render_trades_table(trades, title=f"{user} — selected strategy trades")
+            # header + strategy grid
+            picked_strats = render_user_table_with_toggles(user, df_user)
+
+            # per-user calendar expander (if toggled on)
+            if st.session_state.get(cal_state_key, False):
+                with st.expander(f"{user} — Daily PnL Calendar (click to close)", expanded=True):
+                    if st.button("Close", key=f"dc_close_cal_{safe_key}"):
+                        st.session_state[cal_state_key] = False
+                        _rerun()
+
+                    chart = _calendar_chart(df_user, d1, d2, title=f"{user} — Daily PnL")
+                    if chart is None:
+                        st.caption("No data for this range.")
                     else:
-                        st.caption("No trades to show for the selected strategies.")
-                else:
-                    st.caption("Select strategies above to show the trade table.")
+                        st.altair_chart(chart, use_container_width=True)
 
-        # --- PASS 3: charts (also aligned across columns) ---
-        cols = st.columns(len(users))
-        for col, (user, trades, _has_selection) in zip(cols, user_data):
-            with col:
+            # Build the trades set used later (table + chart below)
+            if picked_strats:
+                trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
+                has_selection = True
+            else:
+                trades = df_user.copy()
+                has_selection = False
+
+            trades = trades[trades["Right"].isin(["C", "P"])]
+            user_data.append((user, trades, has_selection))
+
+
+    # --- PASS 2: trade tables ---
+    cols = st.columns(len(users))
+    for col, (user, trades, has_selection) in zip(cols, user_data):
+        with col:
+            if has_selection:
                 if not trades.empty:
-                    _pnl_line_chart(trades, title=f"{user} — PnL over time")
+                    render_trades_table(trades, title=f"{user} — selected strategy trades")
                 else:
-                    st.caption("No trades to chart.")
-    # (Dropped duplicate breakdown table per user request)
+                    st.caption("No trades to show for the selected strategies.")
+            else:
+                st.caption("Select strategies above to show the trade table.")
+
+    # --- PASS 3: charts ---
+    cols = st.columns(len(users))
+    for col, (user, trades, _has_selection) in zip(cols, user_data):
+        with col:
+            if not trades.empty:
+                _pnl_line_chart(trades, title=f"{user} — PnL over time")
+            else:
+                st.caption("No trades to chart.")
+
     return
