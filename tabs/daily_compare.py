@@ -611,13 +611,45 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     visible_winrt = (total_wins / trade_denom) * 100.0 if trade_denom > 0 else 0.0
     visible_pcr   = _pcr(visible_pnl, visible_prem)
 
-    _user_header(
-        name=user,
-        pcr_pct=visible_pcr,
-        win_rate_pct=visible_winrt,
-        total_pnl=visible_pnl,
-        total_premium=visible_prem,
-    )
+    # Header row: [ tiny calendar button | name + badges ]
+    safe_key = user.replace(" ", "_").lower()
+    btn_title = f"Show {user} calendar"  # used for tooltip AND CSS targeting
+
+    bcol, hcol = st.columns([0.045, 0.955])
+
+    with bcol:
+        # Render the button first
+        clicked = st.button(
+            "📅",
+            key=f"dc_btn_cal_header_{safe_key}",
+            help=btn_title,             # becomes the <button title="..."> attribute
+            use_container_width=False,  # keep it small so it doesn't look tall/wide
+        )
+        # Nudge the button up so it aligns with the name baseline
+        st.markdown(
+            f"""
+            <style>
+            /* Target just this user's calendar button by its title tooltip */
+            button[title="{btn_title}"] {{
+                transform: translateY(-10px);   /* raise/lower as needed */
+                padding: 0.15rem 0.35rem;       /* compact size */
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        if clicked:
+            start_d, end_d = st.session_state.get("dc_date_range")
+            _show_calendar_modal(user, df_user, start_d, end_d)
+
+    with hcol:
+        _user_header(
+            name=user,
+            pcr_pct=visible_pcr,
+            win_rate_pct=visible_winrt,
+            total_pnl=visible_pnl,
+            total_premium=visible_prem,
+        )
 
     if stats_for_grid.empty:
         st.caption("No strategies found for this user in the selected date range.")
@@ -873,39 +905,20 @@ def daily_compare_tab():
 
     # --- PASS 1: headers + grids; collect per-user trades ---
     user_data = []
+
+    # one column per selected user
     cols = st.columns(len(users))
     for col, user in zip(cols, users):
         with col:
+            # data for this user within the selected date range
             df_user = view[view["User"] == user].copy()
 
-            # --- small per-user calendar button (toggle) ---
-            safe_key = user.replace(" ", "_").lower()
-            cal_state_key = f"dc_calendar_open_{safe_key}"
-
-            # top-right tiny button row
-            ctl_l, ctl_r = st.columns([0.86, 0.14])
-            with ctl_r:
-                if st.button("📅", key=f"dc_btn_cal_{safe_key}", help=f"Show {user} calendar", use_container_width=True):
-                    _show_calendar_modal(user, df_user, d1, d2)  # <-- opens modal
-
-
-            # header + strategy grid
+            # renders the header (name + stats) and the strategy table
+            # NOTE: your render_user_table_with_toggles() should contain the small
+            #       calendar button next to the name and open the modal from there.
             picked_strats = render_user_table_with_toggles(user, df_user)
 
-            # per-user calendar expander (if toggled on)
-            if st.session_state.get(cal_state_key, False):
-                with st.expander(f"{user} — Daily PnL Calendar (click to close)", expanded=True):
-                    if st.button("Close", key=f"dc_close_cal_{safe_key}"):
-                        st.session_state[cal_state_key] = False
-                        _rerun()
-
-                    chart = _calendar_chart(df_user, d1, d2, title=f"{user} — Daily PnL")
-                    if chart is None:
-                        st.caption("No data for this range.")
-                    else:
-                        st.altair_chart(chart, use_container_width=True)
-
-            # Build the trades set used later (table + chart below)
+            # build the trades set used later (tables + charts)
             if picked_strats:
                 trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
                 has_selection = True
@@ -913,9 +926,10 @@ def daily_compare_tab():
                 trades = df_user.copy()
                 has_selection = False
 
+            # keep only option trades
             trades = trades[trades["Right"].isin(["C", "P"])]
-            user_data.append((user, trades, has_selection))
 
+            user_data.append((user, trades, has_selection))
 
     # --- PASS 2: trade tables ---
     cols = st.columns(len(users))
