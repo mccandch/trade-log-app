@@ -157,7 +157,7 @@ def open_sheet():
 
 @st.cache_data(ttl=60)
 def load_sheets_data() -> pd.DataFrame:
-    """Read Raw_* tabs and normalize columns for the app, with a brief stability check."""
+    """Read Raw_* tabs and normalize columns for the app, with per-row User fallback to tab name."""
     import time
 
     sh = open_sheet()
@@ -187,11 +187,10 @@ def load_sheets_data() -> pd.DataFrame:
 
             df = _rename_cols(df)
 
-            # Ensure User
-            if "User" not in df.columns or df["User"].isna().all():
-                df["User"] = title.replace("Raw_", "", 1)
+            # Tab-derived canonical user (e.g., "Raw_Salah" -> "Salah")
+            tab_user = title.replace("Raw_", "", 1).strip()
 
-            # Build DateTime / Date
+            # Build DateTime / Date (prefer DateTime, else Date)
             if "DateTime" in df.columns:
                 dt = pd.to_datetime(df["DateTime"], errors="coerce")
             elif "Date" in df.columns:
@@ -214,8 +213,7 @@ def load_sheets_data() -> pd.DataFrame:
                     "CALL": "C", "CALLS": "C",
                     "PUT": "P", "PUTS": "P",
                     "1": "C", "2": "P",
-                    "NAN": pd.NA, "NONE": pd.NA,
-                    "": pd.NA, "NA": pd.NA, "N/A": pd.NA
+                    "NAN": pd.NA, "NONE": pd.NA, "": pd.NA, "NA": pd.NA, "N/A": pd.NA
                 })
                 ser = ser.where(ser.isin(["C", "P"]), pd.NA)
                 df["Right"] = ser
@@ -229,11 +227,38 @@ def load_sheets_data() -> pd.DataFrame:
             cols = [c for c in keep if c in df.columns]
             out = df[cols].copy()
 
+            # ---- USER NORMALIZATION (robust) ----
+            # 1) If there is no "User" column, create it from the tab
+            if "User" not in out.columns:
+                out["User"] = tab_user
+
+            # 2) Normalize whitespace / NBSP / casing
+            out["User"] = (
+                out["User"].astype(str)
+                .str.replace("\u00A0", " ", regex=False)  # NBSP -> space
+                .str.strip()
+            )
+
+            # 3) Per-row fallback: if blank/NA/garbage, fill from the tab
+            blank_mask = (
+                out["User"].isna()
+                | (out["User"] == "")
+                | out["User"].str.lower().isin(["nan", "none", "null"])
+            )
+            out.loc[blank_mask, "User"] = tab_user
+
+            # 4) Canonicalize common variants (optional)
+            out["User"] = out["User"].replace({
+                "chad": "Chad",
+                "kelly": "Kelly",
+                "salah": "Salah",
+            })
+
             out["__source_tab"] = title
             frames.append(out)
         return frames
 
-    # Stability: compare signatures across two reads
+    # Read twice quickly and compare simple signatures to avoid mid-edit races
     def _signature(frames: list[pd.DataFrame]) -> list[tuple]:
         sig = []
         for f in frames:
@@ -246,13 +271,13 @@ def load_sheets_data() -> pd.DataFrame:
 
     frames_final: list[pd.DataFrame] = []
     last_frames: list[pd.DataFrame] = []
-    for _attempt in range(5):
+    for _ in range(5):
         f1 = _read_all_raw_tabs()
-        sig1 = _signature(f1)
+        s1 = _signature(f1)
         time.sleep(0.7)
         f2 = _read_all_raw_tabs()
-        sig2 = _signature(f2)
-        if sig1 == sig2:
+        s2 = _signature(f2)
+        if s1 == s2:
             frames_final = f2
             break
         last_frames = f2
@@ -596,6 +621,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 
     stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
 
+    # ---- compute header badges (uses numeric sums, not the formatted strings)
     if stats_for_grid.empty:
         visible_pnl = 0.0
         visible_prem = 0.0
@@ -611,28 +637,19 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     visible_winrt = (total_wins / trade_denom) * 100.0 if trade_denom > 0 else 0.0
     visible_pcr   = _pcr(visible_pnl, visible_prem)
 
-    # Header row: [ tiny calendar button | name + badges ]
+    # ---- header area ----
     safe_key = user.replace(" ", "_").lower()
-    btn_title = f"Show {user} calendar"  # used for tooltip AND CSS targeting
+    btn_title = f"Show {user} calendar"
 
     bcol, hcol = st.columns([0.045, 0.955])
-
     with bcol:
-        # Render the button first
-        clicked = st.button(
-            "📅",
-            key=f"dc_btn_cal_header_{safe_key}",
-            help=btn_title,             # becomes the <button title="..."> attribute
-            use_container_width=False,  # keep it small so it doesn't look tall/wide
-        )
-        # Nudge the button up so it aligns with the name baseline
+        clicked = st.button("📅", key=f"dc_btn_cal_header_{safe_key}", help=btn_title, use_container_width=False)
         st.markdown(
             f"""
             <style>
-            /* Target just this user's calendar button by its title tooltip */
             button[title="{btn_title}"] {{
-                transform: translateY(-10px);   /* raise/lower as needed */
-                padding: 0.15rem 0.35rem;       /* compact size */
+                transform: translateY(-10px);
+                padding: 0.15rem 0.35rem;
             }}
             </style>
             """,
@@ -655,15 +672,24 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         st.caption("No strategies found for this user in the selected date range.")
         return []
 
+    # =========================
+    # AG Grid (format + sizing)
+    # =========================
     gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
     gb.configure_selection("multiple", use_checkbox=True)
-    gb.configure_default_column(cellStyle={"textAlign": "center"})
+    gb.configure_default_column(
+        cellStyle={"textAlign": "center"},
+        resizable=True,
+        minWidth=60,
+    )
 
+    # Value formatters (display only; underlying values remain numeric)
     pctFmt = JsCode("""
       function(p){
         if (p.value==null) return '';
         const v = Number(p.value);
-        return isNaN(v) ? '' : (v.toFixed(1) + '%');
+        if (isNaN(v)) return '';
+        return v.toFixed(1) + '%';
       }
     """)
     intFmt = JsCode("""
@@ -678,19 +704,28 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         if (p.value==null) return '';
         const v = Number(p.value);
         if (isNaN(v)) return '';
-        const abs = Math.abs(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+        const abs = Math.abs(v).toLocaleString(undefined,
+          {minimumFractionDigits:2, maximumFractionDigits:2});
         return (v < 0 ? '-$' : '$') + abs;
       }
     """)
 
+    # Column configs + formatters
     gb.configure_column("Strategy", headerClass="dc-center")
-    gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
-    gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
-    gb.configure_column("Premium", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
-    gb.configure_column("Trades", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
-    gb.configure_column("Winners", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
-    gb.configure_column("Losers", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
-    gb.configure_column("PnL", header_name="PnL", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
+    gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Premium", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=moneyFmt)
+    gb.configure_column("Trades", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("Winners", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("Losers", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("PnL", header_name="PnL", headerClass="dc-center",
+                        type=["numericColumn"], valueFormatter=moneyFmt)
 
     row_style = JsCode("""
       function(params){
@@ -704,13 +739,43 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go = gb.build()
     go["getRowStyle"] = row_style
     go["headerHeight"] = 32
-    go["suppressSizeToFit"] = True
-    go["onFirstDataRendered"] = JsCode("""
+    go["suppressSizeToFit"] = True   
+
+    # Autosize to **cell contents only** and cap widths so nothing looks padded
+    autoSizeJs = JsCode("""
       function(params){
-        const all = params.columnApi.getAllDisplayedColumns();
-        params.columnApi.autoSizeColumns(all, false);
+        const ids = params.columnApi.getAllDisplayedColumns().map(c => c.getColId());
+        // true = skip header text; size to cell contents only
+        params.columnApi.autoSizeColumns(ids, true);
+
+        const capsByName = {
+          "Strategy": 140,
+          "PCR": 70,
+          "Win rate": 90,
+          "Premium": 110,
+          "Trades": 70,
+          "Winners": 80,
+          "Losers": 70,
+          "PnL": 110
+        };
+
+        const states = params.columnApi.getColumnState();
+        const widthChanges = [];
+        ids.forEach(id => {
+          const col = params.columnApi.getColumn(id);
+          const def = col.getColDef();
+          const name = def.headerName || def.field || id;
+          const cap = capsByName[name];
+          const st = states.find(s => s.colId === id);
+          if (cap && st && st.width > cap) {
+            widthChanges.push({ key: id, newWidth: cap });
+          }
+        });
+        if (widthChanges.length) params.columnApi.setColumnWidths(widthChanges, false);
       }
     """)
+    go["onFirstDataRendered"] = autoSizeJs
+    go["onGridSizeChanged"]  = autoSizeJs
 
     grid = AgGrid(
         stats_for_grid,
@@ -718,10 +783,11 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         theme="streamlit",
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=True,
+        fit_columns_on_grid_load=False,  # don't override our autosize
         key=f"dc_grid_{user}",
     )
 
+    # --- extract selections from grid ---
     def _extract_selected_rows(g):
         rows = None
         if isinstance(g, dict):
@@ -753,7 +819,6 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 # ===========
 def daily_compare_tab():
     _aggrid_css()
-
     st.subheader("Daily Compare (Google Sheets)")
 
     show_full = st.checkbox("EMA-B schedule: show full week", value=False, key="dc_sched_fullweek")
@@ -769,14 +834,20 @@ def daily_compare_tab():
         st.info("No data found yet. Start your watchers (Raw_* tabs) and click Refresh.")
         return
 
-    # ---- Date range presets & state bootstrap ----
-    min_date, max_date = df["Date"].min(), df["Date"].max()
-    default_range = (max_date, max_date)
+    # --- Date sanitation: pure datetime.date, drop blanks (prevents all prior min/max issues)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df = df.dropna(subset=["Date"]).copy()
+    if df.empty:
+        st.warning("No valid dates found in the sheet. Check Raw_* tabs for blank/invalid Date/DateTime cells.")
+        return
 
-    # Single source of truth for the range
+    min_date = df["Date"].min()
+    max_date = df["Date"].max()
+
+    # Keep your 1-day default; you can switch to (min_date, max_date) if desired
+    default_range = (max_date, max_date)
     st.session_state.setdefault("dc_date_range", default_range)
-    
-    # Bootstrap the individual pickers once
+
     if "dc_start_date" not in st.session_state or "dc_end_date" not in st.session_state:
         s, e = st.session_state["dc_date_range"]
         st.session_state["dc_start_date"] = max(min(s, max_date), min_date)
@@ -786,24 +857,13 @@ def daily_compare_tab():
         return max(min(d, max_date), min_date)
 
     def set_range(start: date, end: date):
-        """Used by preset buttons; updates both pickers + range, then reruns."""
-        start = clamp(start); end = clamp(end)
+        start, end = clamp(start), clamp(end)
         st.session_state["dc_start_date"] = start
         st.session_state["dc_end_date"]   = end
         st.session_state["dc_date_range"] = (start, end)
         _rerun()
 
-    def _sync_and_normalize_dates():
-        """Callback when user edits either picker."""
-        s = clamp(st.session_state["dc_start_date"])
-        e = clamp(st.session_state["dc_end_date"])
-        if s > e:
-            s, e = e, s
-            st.session_state["dc_start_date"] = s
-            st.session_state["dc_end_date"]   = e
-        st.session_state["dc_date_range"] = (s, e)
-
-    # ---------- Preset rows ----------
+    # Preset buttons (unchanged)
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     if r1c1.button("Today", key="dc_btn_today", use_container_width=True):
         t = date.today(); set_range(t, t)
@@ -812,10 +872,7 @@ def daily_compare_tab():
     if r1c3.button("This Week", key="dc_btn_this_week", use_container_width=True):
         d0 = date.today(); start = d0 - timedelta(days=d0.weekday()); set_range(start, d0)
     if r1c4.button("Rolling month", key="dc_btn_rolling_month", use_container_width=True):
-        # True month arithmetic (handles 31 -> 30/28/29 correctly)
-        d0 = date.today()
-        start = d0 - relativedelta(months=1)   # e.g., Oct 31 -> Sep 30; Oct 9 -> Sep 9
-        set_range(start, d0)
+        d0 = date.today(); set_range(d0 - relativedelta(months=1), d0)
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     if r2c1.button("Last Week", key="dc_btn_last_week", use_container_width=True):
@@ -834,58 +891,35 @@ def daily_compare_tab():
     if r2c4.button("YTD", key="dc_btn_ytd", use_container_width=True):
         d0 = date.today(); set_range(date(d0.year, 1, 1), d0)
 
-    # ---------- Left-aligned Start/End pickers ----------
-    c_start, c_gap, c_end, _ = st.columns([0.16, 0.02, 0.16, 0.66])
-
-    with c_start:
-        st.date_input(
-            "Start date",
-            min_value=min_date, max_value=max_date,
-            key="dc_start_date",
-            on_change=_sync_and_normalize_dates,
-        )
-
-    # tiny "end to today" button callback (self-contained to avoid name errors)
-    def _set_end_today(min_d, max_d):
-        from datetime import date as _date
-        def _clamp(d): return max(min(d, max_d), min_d)
-        t = _clamp(_date.today())
-        s = _clamp(st.session_state.get("dc_start_date", t))
-        if s > t:
-            s, t = t, s
+    # Date pickers (unchanged behavior)
+    def _sync_and_normalize_dates():
+        s = clamp(st.session_state["dc_start_date"])
+        e = clamp(st.session_state["dc_end_date"])
+        if s > e:
+            s, e = e, s
             st.session_state["dc_start_date"] = s
-        st.session_state["dc_end_date"] = t
-        st.session_state["dc_date_range"] = (s, t)
+            st.session_state["dc_end_date"]   = e
+        st.session_state["dc_date_range"] = (s, e)
 
+    c_start, _, c_end, _ = st.columns([0.16, 0.02, 0.16, 0.66])
+    with c_start:
+        st.date_input("Start date", min_value=min_date, max_value=max_date, key="dc_start_date", on_change=_sync_and_normalize_dates)
     with c_end:
-        c_e1, c_btn = st.columns([0.985, 0.015])  # very small button column (~1.5% width)
-        with c_e1:
-            st.date_input(
-                "End date",
-                min_value=min_date, max_value=max_date,
-                key="dc_end_date",
-                on_change=_sync_and_normalize_dates,
-            )
-        with c_btn:
-            st.markdown("<div style='margin-top:1.70rem'></div>", unsafe_allow_html=True)
-            if st.button(
-                "",
-                key="dc_btn_today_end",
-                help="Set end date to today",
-                use_container_width=True,
-                on_click=_set_end_today,
-                args=(min_date, max_date),
-            ):
-                pass
+        st.date_input("End date", min_value=min_date, max_value=max_date, key="dc_end_date", on_change=_sync_and_normalize_dates)
 
-    # Pull normalized range for downstream filters
     d1, d2 = st.session_state["dc_date_range"]
 
-    # ---- Filtered view ----
+    # ---- Filtered view for the window
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
 
+    # Optional tiny debug (folded): shows exactly which users App sees after the filter
+    with st.expander("Debug: users in current range", expanded=False):
+        uniq = view["User"].dropna().astype(str).tolist()
+        st.write(sorted({repr(u) for u in uniq}))
+        st.write(pd.Series(uniq).value_counts())
+
     users_in_view = view["User"].dropna().unique().tolist()
-    preferred_user_order = ["Chad", "Kelly", "Sam"]  # add a 3rd user here if desired
+    preferred_user_order = ["Chad", "Kelly", "Salah"]
     ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
                     [u for u in sorted(users_in_view) if u not in preferred_user_order]
 
@@ -893,63 +927,31 @@ def daily_compare_tab():
         st.warning("Nobody placed any trades for the selected date range.")
         st.stop()
 
-    users = st.multiselect(
-        "Users to display", options=ordered_users, default=ordered_users, key="dc_user_filter"
-    )
-
-    # --- Calendar popup render (right after multiselect) ---
-    df_cal = view[view["User"].isin(users)].copy() if users else view.copy()
+    users = st.multiselect("Users to display", options=ordered_users, default=ordered_users, key="dc_user_filter")
     if not users:
         st.caption("No users selected.")
         return
 
-    # --- PASS 1: headers + grids; collect per-user trades ---
+    # ---- Render per-user sections (unchanged)
     user_data = []
-
-    # one column per selected user
     cols = st.columns(len(users))
     for col, user in zip(cols, users):
         with col:
-            # data for this user within the selected date range
             df_user = view[view["User"] == user].copy()
-
-            # renders the header (name + stats) and the strategy table
-            # NOTE: your render_user_table_with_toggles() should contain the small
-            #       calendar button next to the name and open the modal from there.
             picked_strats = render_user_table_with_toggles(user, df_user)
-
-            # build the trades set used later (tables + charts)
-            if picked_strats:
-                trades = df_user[df_user["Strategy"].isin(picked_strats)].copy()
-                has_selection = True
-            else:
-                trades = df_user.copy()
-                has_selection = False
-
-            # keep only option trades
+            trades = df_user[df_user["Strategy"].isin(picked_strats)].copy() if picked_strats else df_user.copy()
             trades = trades[trades["Right"].isin(["C", "P"])]
+            user_data.append((user, trades, bool(picked_strats)))
 
-            user_data.append((user, trades, has_selection))
-
-    # --- PASS 2: trade tables ---
     cols = st.columns(len(users))
     for col, (user, trades, has_selection) in zip(cols, user_data):
         with col:
             if has_selection:
-                if not trades.empty:
-                    render_trades_table(trades, title=f"{user} — selected strategy trades")
-                else:
-                    st.caption("No trades to show for the selected strategies.")
+                render_trades_table(trades, title=f"{user} — selected strategy trades") if not trades.empty else st.caption("No trades to show for the selected strategies.")
             else:
                 st.caption("Select strategies above to show the trade table.")
 
-    # --- PASS 3: charts ---
     cols = st.columns(len(users))
-    for col, (user, trades, _has_selection) in zip(cols, user_data):
+    for col, (user, trades, _) in zip(cols, user_data):
         with col:
-            if not trades.empty:
-                _pnl_line_chart(trades, title=f"{user} — PnL over time")
-            else:
-                st.caption("No trades to chart.")
-
-    return
+            _pnl_line_chart(trades, title=f"{user} — PnL over time") if not trades.empty else st.caption("No trades to chart.")
