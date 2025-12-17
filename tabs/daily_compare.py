@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import List, Optional, Union, BinaryIO
 
+
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -115,6 +117,66 @@ def _numeric_series(df: pd.DataFrame, candidates, default=0.0) -> pd.Series:
     return pd.Series(default, index=df.index, dtype="float64")
 
 
+
+
+# ==========================
+# Strategy normalization
+# ==========================
+def normalize_strategy(val) -> str:
+    """
+    Normalize raw strategy labels to a canonical set so:
+    - grouping is stable
+    - selecting a strategy always shows the underlying trades
+    """
+    if val is None:
+        return ""
+    s = str(val).replace("\u00A0", " ").strip()
+    if not s:
+        return ""
+
+    # Collapse whitespace
+    s_norm = re.sub(r"\s+", " ", s).strip()
+
+    # Canonical map (add variants here as you discover them)
+    canon_map = {
+        # EMA family
+        "EMA": "EMA",
+        "EMA CREDIT SPREAD": "EMA",
+        "EMA CREDIT": "EMA",
+        "EMA CS": "EMA",
+
+        "MEGATREND": "EMA Megatrend",
+        "EMA MEGATREND": "EMA Megatrend",
+        "EMA-MEGATREND": "EMA Megatrend",
+        "EMA MEGA TREND": "EMA Megatrend",
+
+        # Others seen in the app
+        "PH": "PH",
+        "EARLY HOUR": "Early Hour",
+        "EH": "Early Hour",
+
+        "EMA-T": "EMA-T",
+        "EMA T": "EMA-T",
+
+        "EMA-1X": "EMA-1x",
+        "EMA 1X": "EMA-1x",
+        "EMA-1x": "EMA-1x",
+        "EMA 1x": "EMA-1x",
+
+        "EMA-B": "EMA-B",
+        "EMA B": "EMA-B",
+
+        "DI": "DI",
+    }
+
+    key = s_norm.upper()
+    return canon_map.get(key, s_norm)
+
+
+def normalize_strategy_series(ser: pd.Series) -> pd.Series:
+    """Vector-friendly wrapper."""
+    return ser.map(normalize_strategy).astype(str)
+
 def _rerun():
     try:
         st.experimental_rerun()
@@ -226,6 +288,12 @@ def load_sheets_data() -> pd.DataFrame:
             ]
             cols = [c for c in keep if c in df.columns]
             out = df[cols].copy()
+
+            # ---- STRATEGY NORMALIZATION (canonical) ----
+            if "Strategy" in out.columns:
+                out["StrategyCanonical"] = normalize_strategy_series(out["Strategy"].astype(str))
+            else:
+                out["StrategyCanonical"] = ""
 
             # ---- USER NORMALIZATION (robust) ----
             # 1) If there is no "User" column, create it from the tab
@@ -354,7 +422,7 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
 
     g = (
-        dfu.groupby("Strategy", dropna=False)
+        dfu.groupby("StrategyCanonical", dropna=False)
         .agg(
             Premium=("Premium", "sum"),
             PnL=("PnL", "sum"),
@@ -373,6 +441,7 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
     denom = g["Winners"] + g["Losers"]
     g["WinRate"] = np.where(denom > 0, (g["Winners"] / denom) * 100.0, np.nan)
 
+    g.rename(columns={"StrategyCanonical": "Strategy"}, inplace=True)
     g["Strategy"] = g["Strategy"].astype(str)
     g = g.sort_values("Strategy", key=lambda s: s.map(_order_key))
 
@@ -607,19 +676,38 @@ def _calendar_chart(df: pd.DataFrame, start_d: date, end_d: date, title: str = "
 # ===================================
 # AG Grid: per-user strategy selector
 # ===================================
+
 def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str]:
-    stats = _user_strategy_pcr(df_user).copy()
-    stats.rename(columns={"Strategy": "Canonical"}, inplace=True)
-    stats["Strategy"] = stats["Canonical"].map(lambda s: ALIAS.get(s, s))
+    # Use canonical strategies for grouping + filtering
+    dfu = df_user.copy()
+    if "StrategyCanonical" not in dfu.columns:
+        dfu["StrategyCanonical"] = normalize_strategy_series(dfu.get("Strategy", pd.Series([""] * len(dfu))))
+
+    stats = _user_strategy_pcr(dfu).copy()  # Strategy is canonical here
+
+    # Display aliases (cosmetic only)
+    DISPLAY_ALIAS = {
+        "Early Hour": "EH",
+        "EMA Megatrend": "EMA Megatrend",
+        "EMA": "EMA",
+        "PH": "PH",
+        "EMA-T": "EMA-T",
+        "EMA-1x": "EMA-1x",
+        "EMA-B": "EMA-B",
+        "DI": "DI",
+    }
+
+    stats["Canonical"] = stats["Strategy"].astype(str)
+    stats["Strategy"] = stats["Canonical"].map(lambda s: DISPLAY_ALIAS.get(s, s))
+
     stats["PCR %"] = stats["PCR"].round(1)
     stats["Win %"] = stats["WinRate"].round(1)
 
-    dfu = df_user.copy()
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
-    pnl_map = dfu.groupby("Strategy", dropna=False)["PnL"].sum().to_dict()
+    pnl_map = dfu.groupby("StrategyCanonical", dropna=False)["PnL"].sum().to_dict()
     stats["PnL"] = stats["Canonical"].map(pnl_map).fillna(0.0)
 
-    stats_for_grid = stats[["Strategy", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
+    stats_for_grid = stats[["Strategy", "Canonical", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
 
     # ---- compute header badges (uses numeric sums, not the formatted strings)
     if stats_for_grid.empty:
@@ -671,6 +759,139 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     if stats_for_grid.empty:
         st.caption("No strategies found for this user in the selected date range.")
         return []
+
+    gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
+    gb.configure_selection("multiple", use_checkbox=True)
+    gb.configure_default_column(
+        cellStyle={"textAlign": "center"},
+        resizable=True,
+        minWidth=60,
+    )
+
+    # Hidden canonical column (still returned in selected_rows)
+    gb.configure_column("Canonical", hide=True)
+
+    pctFmt = JsCode("""
+      function(p){
+        if (p.value==null) return '';
+        const v = Number(p.value);
+        if (isNaN(v)) return '';
+        return v.toFixed(1) + '%';
+      }
+    """)
+    intFmt = JsCode("""
+      function(p){
+        if (p.value==null) return '';
+        const v = Number(p.value);
+        return isNaN(v) ? '' : v.toFixed(0);
+      }
+    """)
+    moneyFmt = JsCode("""
+      function(p){
+        if (p.value==null) return '';
+        const v = Number(p.value);
+        if (isNaN(v)) return '';
+        const abs = Math.abs(v).toLocaleString(undefined,
+          {minimumFractionDigits:2, maximumFractionDigits:2});
+        return (v < 0 ? '-$' : '$') + abs;
+      }
+    """)
+
+    gb.configure_column("Strategy", headerClass="dc-center")
+    gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
+    gb.configure_column("Premium", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
+    gb.configure_column("Trades", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("Winners", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("Losers", headerClass="dc-center", type=["numericColumn"], valueFormatter=intFmt)
+    gb.configure_column("PnL", header_name="PnL", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
+
+    row_style = JsCode("""
+      function(params){
+        const v = Number(params.data["PCR %"]);
+        if (isNaN(v)) return null;
+        return {
+          backgroundColor: (v>0) ? "#143d2b" : (v<0 ? "#4b1f1f" : "transparent"),
+          color: "white"
+        };
+      }
+    """)
+
+    go = gb.build()
+    go["getRowStyle"] = row_style
+    go["headerHeight"] = 32
+    go["suppressSizeToFit"] = True
+
+    autoSizeJs = JsCode("""
+      function(params){
+        const ids = params.columnApi.getAllDisplayedColumns().map(c => c.getColId());
+        params.columnApi.autoSizeColumns(ids, true);
+
+        const capsByName = {
+          "Strategy": 140,
+          "PCR": 70,
+          "Win rate": 90,
+          "Premium": 110,
+          "Trades": 70,
+          "Winners": 80,
+          "Losers": 70,
+          "PnL": 110
+        };
+
+        const states = params.columnApi.getColumnState();
+        const widthChanges = [];
+        ids.forEach(id => {
+          const col = params.columnApi.getColumn(id);
+          const def = col.getColDef();
+          const name = def.headerName || def.field || id;
+          const cap = capsByName[name];
+          const st = states.find(s => s.colId === id);
+          if (cap && st && st.width > cap) {
+            widthChanges.push({ key: id, newWidth: cap });
+          }
+        });
+        if (widthChanges.length) params.columnApi.setColumnWidths(widthChanges, false);
+      }
+    """)
+    go["onFirstDataRendered"] = autoSizeJs
+    go["onGridSizeChanged"]  = autoSizeJs
+
+    grid = AgGrid(
+        stats_for_grid,
+        gridOptions=go,
+        theme="streamlit",
+        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=False,
+        key=f"dc_grid_{user}",
+    )
+
+    def _extract_selected_rows(g):
+        rows = None
+        if isinstance(g, dict):
+            rows = g.get("selected_rows") or g.get("selectedRows")
+        if rows is None:
+            try:
+                rows = getattr(g, "selected_rows", None) or getattr(g, "selectedRows", None)
+            except Exception:
+                rows = None
+        if rows is None:
+            return []
+        if isinstance(rows, pd.DataFrame):
+            return rows.to_dict("records")
+        if isinstance(rows, list):
+            return rows
+        return []
+
+    selected_rows = _extract_selected_rows(grid)
+
+    picked_canonical = [
+        r.get("Canonical") for r in selected_rows
+        if isinstance(r, dict) and r.get("Canonical")
+    ]
+
+    st.session_state[f"dc_sel_{user}"] = picked_canonical
+    return picked_canonical
 
     # =========================
     # AG Grid (format + sizing)
@@ -912,12 +1133,6 @@ def daily_compare_tab():
     # ---- Filtered view for the window
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
 
-    # Optional tiny debug (folded): shows exactly which users App sees after the filter
-    with st.expander("Debug: users in current range", expanded=False):
-        uniq = view["User"].dropna().astype(str).tolist()
-        st.write(sorted({repr(u) for u in uniq}))
-        st.write(pd.Series(uniq).value_counts())
-
     users_in_view = view["User"].dropna().unique().tolist()
     preferred_user_order = ["Chad", "Kelly", "Salah"]
     ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
@@ -938,8 +1153,10 @@ def daily_compare_tab():
     for col, user in zip(cols, users):
         with col:
             df_user = view[view["User"] == user].copy()
+            if "StrategyCanonical" not in df_user.columns:
+                df_user["StrategyCanonical"] = normalize_strategy_series(df_user.get("Strategy", pd.Series([""] * len(df_user))))
             picked_strats = render_user_table_with_toggles(user, df_user)
-            trades = df_user[df_user["Strategy"].isin(picked_strats)].copy() if picked_strats else df_user.copy()
+            trades = df_user[df_user["StrategyCanonical"].isin(picked_strats)].copy() if picked_strats else df_user.copy()
             trades = trades[trades["Right"].isin(["C", "P"])]
             user_data.append((user, trades, bool(picked_strats)))
 
