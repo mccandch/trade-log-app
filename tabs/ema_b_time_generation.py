@@ -1111,3 +1111,169 @@ def ema_b_time_generation_tab():
                             st.session_state.ema_b_phase3_put_scores = None
                             st.session_state.ema_b_phase3_call_scores = None
                             st.rerun()
+
+
+    # ----------------------------
+    # Phase 4 — Filter Phase 1 entries to Phase 3 KEEP buckets
+    # ----------------------------
+    with st.expander("Phase 4 — Filter Phase 1 entries to KEEP buckets", expanded=False):
+        st.caption(
+            "Filters the Phase 1 PUT/CALL entry files down to ONLY rows whose OPEN_DATETIME falls inside "
+            "a Phase 3 KEEP bucket (15-minute buckets)."
+        )
+
+        # Session state outputs
+        if "ema_b_phase4_put_filtered" not in st.session_state:
+            st.session_state.ema_b_phase4_put_filtered = None
+        if "ema_b_phase4_call_filtered" not in st.session_state:
+            st.session_state.ema_b_phase4_call_filtered = None
+
+        # Inputs (in-memory)
+        phase1_put_df = st.session_state.get("ema_b_phase1_bullish")   # PUT entries
+        phase1_call_df = st.session_state.get("ema_b_phase1_bearish") # CALL entries
+
+        put_scores = st.session_state.get("ema_b_phase3_put_scores")
+        call_scores = st.session_state.get("ema_b_phase3_call_scores")
+
+        # --- Logic mirrors EMA-B step 3.py ---
+        BUCKET_LEN_MIN = 15  # [start, start+15)
+        WEEKDAY_MAP = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
+        WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+        def _hhmm_to_minutes(hhmm: str) -> int:
+            h, m = hhmm.split(":")
+            return int(h) * 60 + int(m)
+
+        def build_bucket_lookup(bucket_list):
+            # { "Mon": [(start,end), ...], ... }
+            out = {d: [] for d in WEEKDAYS}
+            for day, start in bucket_list:
+                out[day].append((int(start), int(start) + BUCKET_LEN_MIN))
+            for d in out:
+                out[d].sort(key=lambda x: x[0])
+            return out
+
+        def in_any_bucket(day_abbrev: str, minute_of_day: int, bucket_lookup: dict) -> bool:
+            intervals = bucket_lookup.get(day_abbrev, [])
+            for start, end in intervals:
+                if minute_of_day >= start and minute_of_day < end:
+                    return True
+            return False
+
+        def _keep_buckets_from_scores(scores_df: pd.DataFrame) -> list[tuple[str, int]]:
+            # Scores DF columns (Phase 3): TIME_BUCKET, WEEKDAY, KEEP
+            keep_df = scores_df[scores_df["KEEP"]].copy()
+            bucket_list = []
+            for _, r in keep_df.iterrows():
+                day = str(r["WEEKDAY"])
+                tb = str(r["TIME_BUCKET"])
+                if day in WEEKDAYS and ":" in tb:
+                    bucket_list.append((day, _hhmm_to_minutes(tb)))
+            # stable / deterministic
+            return sorted(set(bucket_list), key=lambda x: (WEEKDAYS.index(x[0]), x[1]))
+
+        def _filter_entries_to_keep_buckets(entries_df: pd.DataFrame, bucket_list: list[tuple[str, int]]) -> tuple[pd.DataFrame, dict]:
+            if entries_df is None or len(entries_df) == 0:
+                return entries_df, {"input_rows": 0, "bad_open_datetime": 0, "output_rows": 0}
+
+            if "OPEN_DATETIME" not in entries_df.columns:
+                raise ValueError(f"Missing required column OPEN_DATETIME. Found columns: {list(entries_df.columns)}")
+
+            df = entries_df.copy()
+
+            # Parse OPEN_DATETIME exactly as script does
+            open_dt = pd.to_datetime(df["OPEN_DATETIME"], format="%Y-%m-%d %H:%M", errors="coerce")
+            bad = int(open_dt.isna().sum())
+            if bad:
+                df = df.loc[~open_dt.isna()].copy()
+                open_dt = open_dt.loc[~open_dt.isna()]
+
+            bucket_lookup = build_bucket_lookup(bucket_list)
+
+            weekday_abbrev = open_dt.dt.weekday.map(WEEKDAY_MAP)
+            minute_of_day = open_dt.dt.hour * 60 + open_dt.dt.minute
+
+            keep_mask = [
+                (d in bucket_lookup) and in_any_bucket(d, int(m), bucket_lookup)
+                for d, m in zip(weekday_abbrev.fillna(""), minute_of_day)
+            ]
+
+            out_df = df.loc[keep_mask].copy()
+
+            # Enforce exact output formatting (YYYY-MM-DD HH:MM)
+            out_df["OPEN_DATETIME"] = pd.to_datetime(out_df["OPEN_DATETIME"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+            if "CLOSE_DATETIME" in out_df.columns:
+                out_df["CLOSE_DATETIME"] = pd.to_datetime(out_df["CLOSE_DATETIME"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+
+            stats = {"input_rows": int(len(df)), "bad_open_datetime": bad, "output_rows": int(len(out_df))}
+            return out_df.reset_index(drop=True), stats
+
+        # --- Availability checks ---
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**PUT side**")
+            st.write("✅ Phase 1 PUT entries" if phase1_put_df is not None else "❌ Phase 1 PUT entries")
+            st.write("✅ Phase 3 PUT scores" if put_scores is not None else "❌ Phase 3 PUT scores")
+        with c2:
+            st.write("**CALL side**")
+            st.write("✅ Phase 1 CALL entries" if phase1_call_df is not None else "❌ Phase 1 CALL entries")
+            st.write("✅ Phase 3 CALL scores" if call_scores is not None else "❌ Phase 3 CALL scores")
+
+        can_run_put = (phase1_put_df is not None) and (put_scores is not None)
+        can_run_call = (phase1_call_df is not None) and (call_scores is not None)
+
+        run4 = st.button(
+            "Generate filtered PUT + CALL files",
+            type="primary",
+            disabled=(not can_run_put and not can_run_call),
+            key="ema_b_phase4_run",
+        )
+
+        if run4:
+            try:
+                if can_run_put:
+                    put_bucket_list = _keep_buckets_from_scores(put_scores)
+                    filtered_put, put_stats = _filter_entries_to_keep_buckets(phase1_put_df, put_bucket_list)
+                    st.session_state.ema_b_phase4_put_filtered = filtered_put
+                    st.write(f"PUT: {put_stats['input_rows']} → {put_stats['output_rows']} rows (dropped {put_stats['bad_open_datetime']} bad OPEN_DATETIME)")
+
+                if can_run_call:
+                    call_bucket_list = _keep_buckets_from_scores(call_scores)
+                    filtered_call, call_stats = _filter_entries_to_keep_buckets(phase1_call_df, call_bucket_list)
+                    st.session_state.ema_b_phase4_call_filtered = filtered_call
+                    st.write(f"CALL: {call_stats['input_rows']} → {call_stats['output_rows']} rows (dropped {call_stats['bad_open_datetime']} bad OPEN_DATETIME)")
+
+                st.success("Phase 4 outputs generated.")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+
+        # Downloads
+        st.markdown("### Download")
+        d1, d2 = st.columns(2)
+
+        put_filtered = st.session_state.get("ema_b_phase4_put_filtered")
+        call_filtered = st.session_state.get("ema_b_phase4_call_filtered")
+
+        with d1:
+            if put_filtered is not None:
+                st.download_button(
+                    "Download PUT filtered file",
+                    data=put_filtered.to_csv(index=False).encode("utf-8"),
+                    file_name="bullish_entries_KEEP_BUCKETS.csv",
+                    mime="text/csv",
+                    key="ema_b_phase4_download_put",
+                )
+        with d2:
+            if call_filtered is not None:
+                st.download_button(
+                    "Download CALL filtered file",
+                    data=call_filtered.to_csv(index=False).encode("utf-8"),
+                    file_name="bearish_entries_KEEP_BUCKETS.csv",
+                    mime="text/csv",
+                    key="ema_b_phase4_download_call",
+                )
+
+        if st.button("Clear Phase 4 outputs", key="ema_b_phase4_clear"):
+            st.session_state.ema_b_phase4_put_filtered = None
+            st.session_state.ema_b_phase4_call_filtered = None
+            st.rerun()
