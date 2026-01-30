@@ -407,11 +407,12 @@ def _phase2_build_paste_ready_tsv(
     lookback_windows_days: list[int],
     output_trades_pivot: bool,
     blank_rows_between_windows: int,
-) -> Tuple[bytes, pd.DataFrame]:
+) -> Tuple[bytes, pd.DataFrame, dict[int, pd.DataFrame]]:
     """
     Returns:
       - TSV bytes (paste-ready)
       - First WIN_PCT pivot (for preview) for the smallest window in lookback_windows_days
+      - Dict of WIN_PCT pivots for each window_days
     """
     if df.empty:
         raise ValueError("No valid rows after parsing. Check the input file format/content.")
@@ -427,6 +428,7 @@ def _phase2_build_paste_ready_tsv(
     buf.write("Earliest trade:\t" + str(earliest_trade) + "\n\n")
 
     preview_win_pivot = None
+    win_pivots_by_days: dict[int, pd.DataFrame] = {}
 
     for days in windows:
         start_dt = _phase2_window_start_from_latest(df, days)
@@ -435,6 +437,8 @@ def _phase2_build_paste_ready_tsv(
 
         if preview_win_pivot is None:
             preview_win_pivot = win_pivot.copy()
+
+        win_pivots_by_days[days] = win_pivot.copy()
 
         _phase2_write_window_section_side_by_side(
             f=buf,
@@ -449,7 +453,7 @@ def _phase2_build_paste_ready_tsv(
     if preview_win_pivot is None:
         preview_win_pivot = pd.DataFrame(index=_PHASE2_TIME_INDEX, columns=_PHASE2_WEEKDAY_COLS)
 
-    return buf.getvalue().encode("utf-8"), preview_win_pivot
+    return buf.getvalue().encode("utf-8"), preview_win_pivot, win_pivots_by_days
 
 
 # ----------------------------
@@ -614,6 +618,13 @@ def ema_b_time_generation_tab():
         if "ema_b_phase2_call_preview" not in st.session_state:
             st.session_state.ema_b_phase2_call_preview = None
 
+        if "ema_b_phase2_put_win_pivots" not in st.session_state:
+            st.session_state.ema_b_phase2_put_win_pivots = None
+        if "ema_b_phase2_call_win_pivots" not in st.session_state:
+            st.session_state.ema_b_phase2_call_win_pivots = None
+        if "ema_b_phase2_windows" not in st.session_state:
+            st.session_state.ema_b_phase2_windows = None
+
         st.markdown("### 1) Upload backtester trade logs")
         ucol1, ucol2 = st.columns(2)
         with ucol1:
@@ -677,10 +688,12 @@ def ema_b_time_generation_tab():
             try:
                 windows = _parse_windows(windows_str)
 
+                st.session_state.ema_b_phase2_windows = windows
+
                 if put_up is not None:
                     put_df_raw = pd.read_csv(put_up)
                     put_df = _phase2_prepare_trades_df(put_df_raw)
-                    put_tsv, put_preview = _phase2_build_paste_ready_tsv(
+                    put_tsv, put_preview, put_win_pivots = _phase2_build_paste_ready_tsv(
                         put_df,
                         lookback_windows_days=windows,
                         output_trades_pivot=bool(output_trades_pivot),
@@ -688,11 +701,12 @@ def ema_b_time_generation_tab():
                     )
                     st.session_state.ema_b_phase2_put_tsv = put_tsv
                     st.session_state.ema_b_phase2_put_preview = put_preview
+                    st.session_state.ema_b_phase2_put_win_pivots = put_win_pivots
 
                 if call_up is not None:
                     call_df_raw = pd.read_csv(call_up)
                     call_df = _phase2_prepare_trades_df(call_df_raw)
-                    call_tsv, call_preview = _phase2_build_paste_ready_tsv(
+                    call_tsv, call_preview, call_win_pivots = _phase2_build_paste_ready_tsv(
                         call_df,
                         lookback_windows_days=windows,
                         output_trades_pivot=bool(output_trades_pivot),
@@ -700,6 +714,7 @@ def ema_b_time_generation_tab():
                     )
                     st.session_state.ema_b_phase2_call_tsv = call_tsv
                     st.session_state.ema_b_phase2_call_preview = call_preview
+                    st.session_state.ema_b_phase2_call_win_pivots = call_win_pivots
 
                 st.success("Done. Scroll down to preview + download.")
 
@@ -754,4 +769,345 @@ def ema_b_time_generation_tab():
             st.session_state.ema_b_phase2_call_tsv = None
             st.session_state.ema_b_phase2_put_preview = None
             st.session_state.ema_b_phase2_call_preview = None
+            st.session_state.ema_b_phase2_put_win_pivots = None
+            st.session_state.ema_b_phase2_call_win_pivots = None
+            st.session_state.ema_b_phase2_windows = None
             st.rerun()
+
+
+    # ----------------------------
+    # Phase 3 — Score buckets (in-app replacement for Google Sheets scoring)
+    # ----------------------------
+    with st.expander("Phase 3 — Score buckets (keep / drop)", expanded=False):
+        st.caption(
+            "Uses Phase 2 in-memory WIN% pivots to score each (TIME_BUCKET × WEEKDAY) bucket. "
+            "Buckets earn points per lookback window where WIN% meets the minimum threshold. "
+            "Buckets must meet the minimum WIN% in at least MatchCount windows to be eligible for scoring."
+        )
+
+        # Require Phase 2 outputs (in-memory)
+        phase2_windows = st.session_state.get("ema_b_phase2_windows")
+        put_win_pivots = st.session_state.get("ema_b_phase2_put_win_pivots")
+        call_win_pivots = st.session_state.get("ema_b_phase2_call_win_pivots")
+
+        if not phase2_windows or (put_win_pivots is None and call_win_pivots is None):
+            st.info("Run Phase 2 first (generate bucket TSVs) so Phase 3 has WIN% pivots to score.")
+        else:
+            st.markdown("### 1) Scoring inputs")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                min_win_pct_input = st.number_input(
+                    "Win percentage (min WIN% to earn points)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=65.0,
+                    step=0.5,
+                    help="Example: 65 means WIN% must be 65% or higher for that window to count.",
+                    key="ema_b_phase3_min_win_pct",
+                )
+                min_win_pct = float(min_win_pct_input) / 100.0
+
+            with c2:
+                min_match_count = st.number_input(
+                    "MatchCount (min windows that must meet Win%)",
+                    min_value=1,
+                    max_value=max(1, len(phase2_windows)),
+                    value=3,
+                    step=1,
+                    key="ema_b_phase3_min_match_count",
+                )
+
+            with c3:
+                min_total_points = st.number_input(
+                    "Total Points (min score to KEEP bucket)",
+                    min_value=0,
+                    max_value=10_000,
+                    value=10,
+                    step=1,
+                    key="ema_b_phase3_min_total_points",
+                )
+
+            st.markdown("### 2) Points per lookback window")
+
+            # Default points mapping (matches your Google Sheets defaults when windows are the standard set)
+            default_points_map = {30: 5, 90: 4, 180: 3, 270: 2, 365: 4}
+
+            # Build/editable points table keyed off Phase 2 windows
+            points_df_key = "ema_b_phase3_points_df"
+            windows_tuple_key = "ema_b_phase3_windows_tuple"
+
+            current_windows_tuple = tuple(phase2_windows)
+
+            if st.session_state.get(windows_tuple_key) != current_windows_tuple or st.session_state.get(points_df_key) is None:
+                pts = []
+                for w in phase2_windows:
+                    pts.append({"LOOKBACK_DAYS": int(w), "POINTS": int(default_points_map.get(int(w), 0))})
+                st.session_state[points_df_key] = pd.DataFrame(pts)
+                st.session_state[windows_tuple_key] = current_windows_tuple
+
+            points_df = st.session_state[points_df_key]
+
+            edited_points_df = st.data_editor(
+                points_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "LOOKBACK_DAYS": st.column_config.NumberColumn("LOOKBACK_DAYS", disabled=True),
+                    "POINTS": st.column_config.NumberColumn("POINTS", min_value=0, max_value=10_000, step=1),
+                },
+                key="ema_b_phase3_points_editor",
+            )
+
+            # Normalize edited points into a dict
+            points_map: dict[int, int] = {
+                int(r["LOOKBACK_DAYS"]): int(r["POINTS"])
+                for _, r in edited_points_df.iterrows()
+            }
+
+            st.markdown("### 3) Run scoring")
+
+            show_details = st.checkbox(
+                "Show per-window WIN% and point contributions",
+                value=False,
+                key="ema_b_phase3_show_details",
+            )
+
+            run3 = st.button(
+                "Score buckets",
+                type="primary",
+                key="ema_b_phase3_run",
+            )
+
+            def _score_from_win_pivots(win_pivots_by_days: dict[int, pd.DataFrame]) -> pd.DataFrame:
+                # Build base index of all buckets
+                full_index = pd.MultiIndex.from_product(
+                    [_PHASE2_TIME_INDEX, _PHASE2_WEEKDAY_COLS],
+                    names=["TIME_BUCKET", "WEEKDAY"],
+                )
+                out = pd.DataFrame(index=full_index).reset_index()
+
+                # For each window, pull WIN% into a column and compute pass/points
+                pass_cols = []
+                win_cols = []
+                pts_cols = []
+
+                for days in phase2_windows:
+                    days = int(days)
+                    pivot = win_pivots_by_days.get(days)
+
+                    col_win = f"WIN_{days}D"
+                    col_pass = f"PASS_{days}D"
+                    col_pts = f"PTS_{days}D"
+
+                    if pivot is None:
+                        # If window missing, treat as all NaN
+                        out[col_win] = pd.NA
+                        out[col_pass] = False
+                        out[col_pts] = 0
+                    else:
+                        s = pivot.stack(dropna=False)
+                        # s index: (TIME_BUCKET, WEEKDAY)
+                        s.name = col_win
+                        tmp = s.reset_index()
+                        tmp.columns = ["TIME_BUCKET", "WEEKDAY", col_win]
+                        out = out.merge(tmp, on=["TIME_BUCKET", "WEEKDAY"], how="left")
+
+                        out[col_pass] = (out[col_win].astype("float") >= min_win_pct).fillna(False)
+                        out[col_pts] = out[col_pass].astype(int) * int(points_map.get(days, 0))
+
+                    win_cols.append(col_win)
+                    pass_cols.append(col_pass)
+                    pts_cols.append(col_pts)
+
+                out["MatchCount"] = out[pass_cols].sum(axis=1).astype(int)
+                out["RawScore"] = out[pts_cols].sum(axis=1).astype(int)
+
+                out["Eligible"] = out["MatchCount"] >= int(min_match_count)
+                out["Score"] = out["RawScore"].where(out["Eligible"], 0).astype(int)
+                out["KEEP"] = out["Eligible"] & (out["Score"] >= int(min_total_points))
+
+                # Order columns
+                base_cols = ["TIME_BUCKET", "WEEKDAY", "MatchCount", "Score", "KEEP"]
+                if show_details:
+                    # include win/passes/points
+                    detail_cols = []
+                    for days in phase2_windows:
+                        detail_cols.extend([f"WIN_{int(days)}D", f"PASS_{int(days)}D", f"PTS_{int(days)}D"])
+                    out = out[base_cols + detail_cols]
+                else:
+                    out = out[base_cols]
+
+                # Nice sorting
+                out["TIME_SORT"] = pd.to_datetime("1900-01-01 " + out["TIME_BUCKET"])
+                weekday_order = {d: i for i, d in enumerate(_PHASE2_WEEKDAY_COLS)}
+                out["WD_SORT"] = out["WEEKDAY"].map(weekday_order).astype(int)
+                out = out.sort_values(["TIME_SORT", "WD_SORT"]).drop(columns=["TIME_SORT", "WD_SORT"]).reset_index(drop=True)
+                return out
+
+            if run3:
+                try:
+                    if put_win_pivots is not None:
+                        st.session_state.ema_b_phase3_put_scores = _score_from_win_pivots(put_win_pivots)
+                    else:
+                        st.session_state.ema_b_phase3_put_scores = None
+
+                    if call_win_pivots is not None:
+                        st.session_state.ema_b_phase3_call_scores = _score_from_win_pivots(call_win_pivots)
+                    else:
+                        st.session_state.ema_b_phase3_call_scores = None
+
+                    st.success("Done. See tables below.")
+
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+            # Ensure session keys exist
+            if "ema_b_phase3_put_scores" not in st.session_state:
+                st.session_state.ema_b_phase3_put_scores = None
+            if "ema_b_phase3_call_scores" not in st.session_state:
+                st.session_state.ema_b_phase3_call_scores = None
+
+            st.markdown("### 4) Results")
+
+            put_scores = st.session_state.ema_b_phase3_put_scores
+            call_scores = st.session_state.ema_b_phase3_call_scores
+
+            view_mode = st.radio(
+                "Display mode",
+                options=["Compact grid", "Long table"],
+                horizontal=True,
+                index=0,
+                key="ema_b_phase3_view_mode",
+                help="Compact grid matches the Google Sheets layout (time rows × weekday columns). Long table is useful for exports/debugging.",
+            )
+
+            show_match_in_cells = False
+            if view_mode == "Compact grid":
+                show_match_in_cells = st.checkbox(
+                    "Show MatchCount in cells (Score (MatchCount))",
+                    value=False,
+                    key="ema_b_phase3_show_match_in_cells",
+                )
+
+            def _build_grids(scores_df: pd.DataFrame):
+                # Ensure deterministic ordering
+                weekday_order = list(_PHASE2_WEEKDAY_COLS)
+                time_order = list(_PHASE2_TIME_INDEX)
+
+                # Pivot to grids
+                score_grid = (
+                    scores_df.pivot(index="TIME_BUCKET", columns="WEEKDAY", values="Score")
+                            .reindex(index=time_order, columns=weekday_order)
+                )
+                match_grid = (
+                    scores_df.pivot(index="TIME_BUCKET", columns="WEEKDAY", values="MatchCount")
+                            .reindex(index=time_order, columns=weekday_order)
+                )
+                keep_grid = (
+                    scores_df.pivot(index="TIME_BUCKET", columns="WEEKDAY", values="KEEP")
+                            .reindex(index=time_order, columns=weekday_order)
+                            .fillna(False)
+                )
+                eligible_grid = (match_grid.fillna(0).astype(int) >= int(min_match_count))
+
+                if show_match_in_cells:
+                    # Render "Score (MatchCount)" for readability
+                    display = score_grid.copy()
+                    for r in display.index:
+                        for c in display.columns:
+                            s = display.loc[r, c]
+                            m = match_grid.loc[r, c]
+                            if pd.isna(s) and pd.isna(m):
+                                display.loc[r, c] = ""
+                            else:
+                                s_int = int(0 if pd.isna(s) else s)
+                                m_int = int(0 if pd.isna(m) else m)
+                                display.loc[r, c] = f"{s_int} ({m_int})"
+                    return display, keep_grid, eligible_grid, score_grid, match_grid
+                else:
+                    return score_grid, keep_grid, eligible_grid, score_grid, match_grid
+
+            def _style_compact(display_df: pd.DataFrame, keep_mask: pd.DataFrame, eligible_mask: pd.DataFrame):
+                # High-contrast colors that work in dark mode.
+                KEEP_BG = "#1f6f3a"       # dark green
+                KEEP_FG = "#ffffff"
+                INELIG_BG = "#2b2b2b"     # dark gray
+                INELIG_FG = "#bdbdbd"
+
+                def apply_styles(data):
+                    out = pd.DataFrame("", index=data.index, columns=data.columns)
+                    for r in data.index:
+                        for c in data.columns:
+                            if r not in keep_mask.index or c not in keep_mask.columns:
+                                continue
+                            is_keep = bool(keep_mask.loc[r, c])
+                            is_eligible = bool(eligible_mask.loc[r, c]) if (r in eligible_mask.index and c in eligible_mask.columns) else False
+
+                            if is_keep:
+                                out.loc[r, c] = f"background-color: {KEEP_BG}; color: {KEEP_FG}; font-weight: 700;"
+                            elif not is_eligible:
+                                out.loc[r, c] = f"background-color: {INELIG_BG}; color: {INELIG_FG};"
+                            else:
+                                # Eligible but not keep: no background, readable text
+                                out.loc[r, c] = "color: #e6e6e6;"
+                    return out
+
+                return display_df.style.apply(apply_styles, axis=None)
+
+            r1, r2 = st.columns(2)
+
+            with r1:
+                if put_scores is not None:
+                    st.write("PUT buckets — scored")
+                    if view_mode == "Compact grid":
+                        disp, keep_mask, elig_mask, score_grid, match_grid = _build_grids(put_scores)
+                        st.dataframe(
+                            _style_compact(disp, keep_mask, elig_mask),
+                            use_container_width=True,
+                            height=520,
+                        )
+                    else:
+                        st.dataframe(put_scores, use_container_width=True, height=520)
+
+                    keep_put = put_scores[put_scores["KEEP"]].copy()
+                    keep_put_tsv = keep_put.to_csv(sep="\t", index=False).encode("utf-8")
+                    st.download_button(
+                        "Download PUT keep buckets (TSV)",
+                        data=keep_put_tsv,
+                        file_name="put_keep_buckets.tsv",
+                        mime="text/tab-separated-values",
+                        key="ema_b_phase3_download_put_keep",
+                    )
+                else:
+                    st.info("No PUT pivots found (upload/generate PUTs in Phase 2).")
+
+            with r2:
+                if call_scores is not None:
+                    st.write("CALL buckets — scored")
+                    if view_mode == "Compact grid":
+                        disp, keep_mask, elig_mask, score_grid, match_grid = _build_grids(call_scores)
+                        st.dataframe(
+                            _style_compact(disp, keep_mask, elig_mask),
+                            use_container_width=True,
+                            height=520,
+                        )
+                    else:
+                        st.dataframe(call_scores, use_container_width=True, height=520)
+
+                    keep_call = call_scores[call_scores["KEEP"]].copy()
+                    keep_call_tsv = keep_call.to_csv(sep="\t", index=False).encode("utf-8")
+                    st.download_button(
+                        "Download CALL keep buckets (TSV)",
+                        data=keep_call_tsv,
+                        file_name="call_keep_buckets.tsv",
+                        mime="text/tab-separated-values",
+                        key="ema_b_phase3_download_call_keep",
+                    )
+                else:
+                    st.info("No CALL pivots found (upload/generate CALLs in Phase 2).")
+            if st.button("Clear Phase 3 outputs", key="ema_b_phase3_clear"):
+                            st.session_state.ema_b_phase3_put_scores = None
+                            st.session_state.ema_b_phase3_call_scores = None
+                            st.rerun()
