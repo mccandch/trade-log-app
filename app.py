@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
-# Run locally:
-#   streamlit run app.py --server.fileWatcherType poll --server.runOnSave true
-
 import streamlit as st
+
 import tabs.daily_compare as dc
 import tabs.live_vs_backtest as lvb
+import tabs.ema_b_time_generation as ebtg  # NEW
 
 # Must be the first Streamlit call:
 st.set_page_config(
@@ -14,11 +12,10 @@ st.set_page_config(
 
 st.title("Trade Tools")
 
-# Global compact-table styling (used by Live-vs-Backtest and Daily Compare)
 st.markdown(
     """
 <style>
-.compact-table { width: 100% !important; }
+/* Make tables more compact */
 .compact-table table { width: 100% !important; table-layout: auto !important; border-collapse: collapse; }
 .compact-table th, .compact-table td { white-space: nowrap; padding: 6px 10px; }
 </style>
@@ -26,10 +23,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2 = st.tabs(["Daily Compare", "Live vs Backtest"])
+tab1, tab2, tab3 = st.tabs(["Daily Compare", "Live vs Backtest", "EMA-B Time Generation"])
 
 with tab1:
     dc.daily_compare_tab()
 
 with tab2:
     lvb.live_vs_backtest_tab()
+
+with tab3:
+    ebtg.ema_b_time_generation_tab()
