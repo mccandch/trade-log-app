@@ -1056,6 +1056,48 @@ def ema_b_time_generation_tab():
 
                 return display_df.style.apply(apply_styles, axis=None)
 
+
+            # ---- Phase 3 keep-bucket export helpers (sorted + python arrays) ----
+            _WEEKDAY_ORDER = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4}
+
+            def _phase3_hhmm_to_minutes(hhmm: str) -> int:
+                h, m = str(hhmm).strip().split(":")
+                return int(h) * 60 + int(m)
+
+            def _phase3_sort_keep_df(df_in: pd.DataFrame) -> pd.DataFrame:
+                df_out = df_in.copy()
+                df_out["WD_SORT"] = df_out["WEEKDAY"].map(_WEEKDAY_ORDER)
+                df_out["TIME_SORT"] = pd.to_datetime("1900-01-01 " + df_out["TIME_BUCKET"].astype(str))
+                df_out = (
+                    df_out.sort_values(["WD_SORT", "TIME_SORT"])
+                          .drop(columns=["WD_SORT", "TIME_SORT"])
+                          .reset_index(drop=True)
+                )
+                return df_out
+
+            def _phase3_bucket_list_from_keep_df(df_keep: pd.DataFrame) -> list[tuple[str, int]]:
+                buckets: list[tuple[str, int]] = []
+                for _, r in df_keep.iterrows():
+                    day = str(r.get("WEEKDAY", "")).strip()
+                    tb = str(r.get("TIME_BUCKET", "")).strip()
+                    if day in _WEEKDAY_ORDER and ":" in tb:
+                        buckets.append((day, _phase3_hhmm_to_minutes(tb)))
+                # deterministic: weekday then time
+                return sorted(set(buckets), key=lambda x: (_WEEKDAY_ORDER[x[0]], x[1]))
+
+            def _phase3_bucket_array_text(name: str, buckets: list[tuple[str, int]]) -> str:
+                lines = [f"{name} = ["]
+                current_day = None
+                for day, minutes in buckets:
+                    if day != current_day:
+                        lines.append(f"\n    # {day}")
+                        current_day = day
+                    hh = minutes // 60
+                    mm = minutes % 60
+                    lines.append(f'    ("{day}", {minutes}),  # {hh:02d}:{mm:02d}')
+                lines.append("]\n")
+                return "\n".join(lines)
+
             r1, r2 = st.columns(2)
 
             with r1:
@@ -1072,7 +1114,10 @@ def ema_b_time_generation_tab():
                         st.dataframe(put_scores, use_container_width=True, height=520)
 
                     keep_put = put_scores[put_scores["KEEP"]].copy()
-                    keep_put_tsv = keep_put.to_csv(sep="\t", index=False).encode("utf-8")
+                    keep_put = _phase3_sort_keep_df(keep_put)
+                    put_bucket_list = _phase3_bucket_list_from_keep_df(keep_put)
+                    put_bucket_array = _phase3_bucket_array_text("PUT_BUCKETS", put_bucket_list)
+                    keep_put_tsv = (keep_put.to_csv(sep="\t", index=False) + "\n\n" + put_bucket_array).encode("utf-8")
                     st.download_button(
                         "Download PUT keep buckets (TSV)",
                         data=keep_put_tsv,
@@ -1097,7 +1142,10 @@ def ema_b_time_generation_tab():
                         st.dataframe(call_scores, use_container_width=True, height=520)
 
                     keep_call = call_scores[call_scores["KEEP"]].copy()
-                    keep_call_tsv = keep_call.to_csv(sep="\t", index=False).encode("utf-8")
+                    keep_call = _phase3_sort_keep_df(keep_call)
+                    call_bucket_list = _phase3_bucket_list_from_keep_df(keep_call)
+                    call_bucket_array = _phase3_bucket_array_text("CALL_BUCKETS", call_bucket_list)
+                    keep_call_tsv = (keep_call.to_csv(sep="\t", index=False) + "\n\n" + call_bucket_array).encode("utf-8")
                     st.download_button(
                         "Download CALL keep buckets (TSV)",
                         data=keep_call_tsv,
