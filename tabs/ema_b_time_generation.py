@@ -580,7 +580,7 @@ def ema_b_time_generation_tab():
                 st.download_button(
                     "Download PUT file (Bullish)",
                     data=bull_bytes,
-                    file_name="bullish_entries_with_features_v3_vwap.csv",
+                    file_name="put_entry_times_no_filter.csv",
                     mime="text/csv",
                     key="ema_b_phase1_download_put",
                 )
@@ -588,7 +588,7 @@ def ema_b_time_generation_tab():
                 st.download_button(
                     "Download CALL file (Bearish)",
                     data=bear_bytes,
-                    file_name="bearish_entries_with_features_v3_vwap.csv",
+                    file_name="call_entry_times_no_filter.csv",
                     mime="text/csv",
                     key="ema_b_phase1_download_call",
                 )
