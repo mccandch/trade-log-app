@@ -1,0 +1,103 @@
+# Strategy name normalization rules.
+# NOTE: YAML indentation matters. Every rule must be aligned under `rules:`.
+
+rules:
+  # =========================
+  # EMA-V / EMA-VWAP unify
+  # =========================
+  - source: live
+    match: "EMA-VWAP"
+    canonical: "EMA-VWAP"
+
+  - source: backtest
+    match: '^EMA-V:\s*calls$'
+    canonical: "EMA-VWAP"
+    regex: true
+
+  - source: backtest
+    match: '^EMA-V:\s*puts$'
+    canonical: "EMA-VWAP"
+    regex: true
+
+  # =========================
+  # EMA-T unify (anything containing EMA-T, case-insensitive)
+  # =========================
+  - source: backtest
+    match: '(?i)ema-t'
+    canonical: "EMA-T"
+    regex: true
+
+  - source: live
+    match: '(?i)ema-t'
+    canonical: "EMA-T"
+    regex: true
+
+  # =========================
+  # Other existing mappings
+  # =========================
+  - source: backtest
+    match: "EH: 10:04 call $3 target, 2x stop"
+    canonical: "Early Hour"
+  - source: backtest
+    match: "EH: 10:04 put $3 target, 2x stop"
+    canonical: "Early Hour"
+  - source: backtest
+    match: "EH: 12:48 put $3 target, 2x stop"
+    canonical: "Early Hour"
+
+  - source: backtest
+    match: "EMA-B:  5 minute calls"
+    canonical: "EMA-B"
+  - source: backtest
+    match: "EMA-B: 5 minute puts"
+    canonical: "EMA-B"
+
+  - source: backtest
+    match: "EMA-T: bearish"
+    canonical: "EMA-T"
+  - source: backtest
+    match: "EMA-T: bullish"
+    canonical: "EMA-T"
+
+  - source: backtest
+    match: "EMA:  CCS all tranche"
+    canonical: "EMA Credit Spread"
+  - source: backtest
+    match: "EMA: PCS all tranches"
+    canonical: "EMA Credit Spread"
+
+  - source: backtest
+    match: "PH: DI Call 15:25 "
+    canonical: "PH"
+  - source: backtest
+    match: "PH: DI Put 15:25"
+    canonical: "PH"
+
+  - source: backtest
+    match: "ema-1x:  CCS 20/40"
+    canonical: "EMA-1x"
+  - source: backtest
+    match: "ema-1x:  PCS 20/40"
+    canonical: "EMA-1x"
+
+  # Live side examples (optional, keeps labels consistent)
+  - source: live
+    match: "EMA-1x"
+    canonical: "EMA-1x"
+  - source: live
+    match: "EMA-B"
+    canonical: "EMA-B"
+  - source: live
+    match: "EMA-T"
+    canonical: "EMA-T"
+  - source: live
+    match: "Early Hour"
+    canonical: "Early Hour"
+  - source: live
+    match: "PH"
+    canonical: "PH"
+
+  # Ignore Megatrend on the live side
+  - source: live
+    match: "Megatrend"
+    ignore: true

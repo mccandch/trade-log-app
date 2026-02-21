@@ -29,16 +29,35 @@ def _rerun():
 
 # ---------------- Strategy mapping (YAML + fallback) ----------------
 @st.cache_resource(show_spinner=False)
-def lvb_load_strategy_rules() -> Dict[str, Dict]:
+def lvb_load_strategy_rules(_cache_bust: int = 0) -> Dict[str, Dict]:
+    """
+    Loads mapping rules from strategy_mapping.yaml if present.
+
+    Debug info (visible via lvb_debug_strategy_mapping_panel) is stored in st.session_state:
+      __lvb_yaml_loaded, __lvb_yaml_path, __lvb_yaml_error, __lvb_rule_counts
+    """
     data = None
+    yaml_path = None
+    yaml_error = None
+
     if yaml:
-        for p in (Path(__file__).parent.parent / "strategy_mapping.yaml",
-                  Path.cwd() / "strategy_mapping.yaml"):
+        candidates = [
+            Path(__file__).parent.parent / "strategy_mapping.yaml",
+            Path.cwd() / "strategy_mapping.yaml",
+        ]
+        for p in candidates:
             if p.exists():
-                with p.open("r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        data = yaml.safe_load(f) or {}
+                    yaml_path = str(p)
+                except Exception as e:
+                    yaml_error = f"{type(e).__name__}: {e}"
+                    data = None
                 break
+
     if data is None:
+        # fallback defaults (keeps app usable if YAML missing)
         data = {"rules": [
             {"source":"backtest","match":"EH: 10:04 call $3 target, 2x stop","canonical":"Early Hour"},
             {"source":"backtest","match":"EH: 10:04 put $3 target, 2x stop","canonical":"Early Hour"},
@@ -54,74 +73,212 @@ def lvb_load_strategy_rules() -> Dict[str, Dict]:
             {"source":"backtest","match":"ema-1x:  CCS 20/40","canonical":"EMA-1x"},
             {"source":"backtest","match":"ema-1x:  PCS 20/40","canonical":"EMA-1x"},
         ]}
-    exact = {"live": {}, "backtest": {}}
-    patterns = {"live": [], "backtest": []}
-    for r in data.get("rules", []):
-        src = "live" if str(r.get("source","backtest")).lower().startswith("live") else "backtest"
+        st.session_state["__lvb_yaml_loaded"] = False
+        st.session_state["__lvb_yaml_path"] = None
+    else:
+        st.session_state["__lvb_yaml_loaded"] = True
+        st.session_state["__lvb_yaml_path"] = yaml_path
+
+    st.session_state["__lvb_yaml_error"] = yaml_error
+
+    exact: Dict[str, Dict[str, tuple]] = {"live": {}, "backtest": {}}
+    patterns: Dict[str, list] = {"live": [], "backtest": []}
+
+    exact_ct = {"live": 0, "backtest": 0}
+    patt_ct  = {"live": 0, "backtest": 0}
+    bad_regex = []
+
+    for r in (data or {}).get("rules", []) or []:
+        src = "live" if str(r.get("source", "backtest")).lower().startswith("live") else "backtest"
         canon = r.get("canonical")
         match_val = r.get("match")
         ignore = bool(r.get("ignore", False))
         if not match_val:
             continue
+
         if r.get("regex", False):
             try:
-                patterns[src].append((re.compile(match_val), canon, ignore))
-            except re.error:
-                pass
+                comp = re.compile(str(match_val))
+                patterns[src].append((comp, canon, ignore))
+                patt_ct[src] += 1
+            except re.error as e:
+                bad_regex.append({"source": src, "match": match_val, "error": str(e)})
         else:
             exact[src][str(match_val)] = (canon, ignore)
+            exact_ct[src] += 1
+
+    st.session_state["__lvb_rule_counts"] = {
+        "exact_live": exact_ct["live"],
+        "exact_backtest": exact_ct["backtest"],
+        "regex_live": patt_ct["live"],
+        "regex_backtest": patt_ct["backtest"],
+        "bad_regex": bad_regex,
+        "cache_bust": int(_cache_bust),
+    }
+
     return {"exact": exact, "patterns": patterns}
 
 
+
 def lvb_map_strategy_name(source: str, raw_name: str) -> Tuple[str, bool]:
-    rules = lvb_load_strategy_rules()
+    """
+    Returns (canonical_name, ignore_flag).
+
+    Debug info:
+      __lvb_last_map, __lvb_last_map_result
+    """
+    cache_bust = int(st.session_state.get("__lvb_cache_bust", 0))
+    rules = lvb_load_strategy_rules(cache_bust)
+
     s = "live" if str(source).lower().startswith("live") else "backtest"
     raw = "" if raw_name is None else str(raw_name)
+
+    st.session_state["__lvb_last_map"] = {"source": s, "raw": raw}
+
     maybe = rules["exact"].get(s, {}).get(raw)
     if maybe:
         canon, ign = maybe
+        st.session_state["__lvb_last_map_result"] = {"type": "exact", "canonical": canon, "ignore": ign}
         return (raw if canon is None else canon, ign)
+
     for patt, canon, ign in rules["patterns"].get(s, []):
         try:
             if patt.search(raw):
+                st.session_state["__lvb_last_map_result"] = {"type": "regex", "pattern": patt.pattern, "canonical": canon, "ignore": ign}
                 return (raw if canon is None else canon, ign)
         except re.error:
             pass
+
+    st.session_state["__lvb_last_map_result"] = {"type": "none", "canonical": raw, "ignore": False}
     return raw, False
 
+
+
+
+
+# ---------------- Strategy mapping debug helpers ----------------
+# def lvb_mapping_debug_controls():
+#     """
+#     Drop this into the UI to reload strategy_mapping.yaml without restarting Streamlit.
+#     """
+#     col_a, col_b = st.columns([1, 2])
+#     with col_a:
+#         if st.button("Reload strategy mapping", key="lvb_reload_mapping"):
+#             st.session_state["__lvb_cache_bust"] = int(st.session_state.get("__lvb_cache_bust", 0)) + 1
+#             st.cache_resource.clear()
+#             st.rerun()
+#     with col_b:
+#         path = st.session_state.get("__lvb_yaml_path")
+#         loaded = st.session_state.get("__lvb_yaml_loaded")
+#         counts = st.session_state.get("__lvb_rule_counts")
+#         if loaded is not None:
+#             st.caption(f"Loaded={loaded} | path={path} | rules={counts}")
+
+
+# # def lvb_debug_strategy_mapping_panel(live_raw: pd.DataFrame, back_raw: pd.DataFrame):
+#     """
+#     Expander panel that shows:
+#       - YAML path loaded (or fallback)
+#       - rule counts (exact vs regex)
+#       - raw strategy uniques with repr() (so whitespace is visible)
+#       - mapped uniques
+#       - unchanged values (the ones that aren't matching any rule)
+#     """
+#     with st.expander("🔧 Debug: Strategy mapping", expanded=False):
+#         st.write("YAML loaded:", st.session_state.get("__lvb_yaml_loaded"))
+#         st.write("YAML path:", st.session_state.get("__lvb_yaml_path"))
+#         st.write("YAML error:", st.session_state.get("__lvb_yaml_error"))
+#         st.write("Rule counts:", st.session_state.get("__lvb_rule_counts"))
+
+#         # LIVE
+#         if isinstance(live_raw, pd.DataFrame) and "Strategy" in live_raw.columns:
+#             live_uni = sorted(set(live_raw["Strategy"].dropna().astype(str).unique()))
+#             st.write("LIVE unique Strategy values (repr):")
+#             st.write([repr(s) for s in live_uni])
+#             live_mapped = sorted(set(lvb_map_strategy_name("live", s)[0] for s in live_uni))
+#             st.write("LIVE mapped uniques:")
+#             st.write(live_mapped)
+#         else:
+#             st.warning("Live data has no 'Strategy' column.")
+
+#         # BACKTEST
+#         if isinstance(back_raw, pd.DataFrame) and "Strategy" in back_raw.columns:
+#             back_uni = sorted(set(back_raw["Strategy"].dropna().astype(str).unique()))
+#             st.write("BACKTEST unique Strategy values (repr):")
+#             st.write([repr(s) for s in back_uni])
+#             back_mapped = sorted(set(lvb_map_strategy_name("backtest", s)[0] for s in back_uni))
+#             st.write("BACKTEST mapped uniques:")
+#             st.write(back_mapped)
+
+#             unchanged = sorted([s for s in back_uni if lvb_map_strategy_name("backtest", s)[0] == s])
+#             st.write("BACKTEST unchanged by mapping (repr):")
+#             st.write([repr(s) for s in unchanged])
+
+#             rules = lvb_load_strategy_rules(int(st.session_state.get("__lvb_cache_bust", 0)))
+#             patt_list = [p.pattern for p, _, _ in rules["patterns"]["backtest"]]
+#             st.write("BACKTEST regex patterns loaded:")
+#             st.write(patt_list)
+#         else:
+#             st.warning("Backtest data has no 'Strategy' column.")
+
+#         st.write("Last mapping attempt:", st.session_state.get("__lvb_last_map"))
+#         st.write("Last mapping result:", st.session_state.get("__lvb_last_map_result"))
 
 # ---------------- IO helpers ----------------
 @st.cache_data(show_spinner=False)
 def lvb_read_csv_file(uploaded) -> pd.DataFrame:
-    if hasattr(uploaded, "read"):
-        return pd.read_csv(uploaded)
+    if uploaded is None:
+        return pd.DataFrame()
+
+    # ✅ handle cached bytes
+    if isinstance(uploaded, (bytes, bytearray, memoryview)):
+        return pd.read_csv(io.BytesIO(bytes(uploaded)))
+
+    # ✅ handle UploadedFile / file-like
+    if hasattr(uploaded, "seek"):
+        try:
+            uploaded.seek(0)
+        except Exception:
+            pass
     return pd.read_csv(uploaded)
 
-
 def lvb_persist_upload_bytes(file_obj, state_key: str):
-    if file_obj is not None:
-        # Handle raw bytes first to avoid .seek on bytes
-        if isinstance(file_obj, (bytes, bytearray, memoryview)):
-            st.session_state[state_key] = bytes(file_obj)
-            return io.BytesIO(st.session_state[state_key])
+    """
+    Persist uploaded file bytes into st.session_state[state_key].
 
-        # Try UploadedFile.getvalue(); if not available, fall back to read()
+    Returns:
+        bytes | None
+    """
+
+    # Treat "no file" as no bytes
+    if file_obj is None:
+        st.session_state.pop(state_key, None)
+        return None
+
+    # Streamlit sometimes provides a DeletedFile sentinel when the user clears/replaces the upload.
+    if type(file_obj).__name__ == "DeletedFile":
+        st.session_state.pop(state_key, None)
+        return None
+
+    # If we already have bytes cached, return them
+    cached = st.session_state.get(state_key)
+    if isinstance(cached, (bytes, bytearray)) and len(cached) > 0:
+        return cached
+
+    # Only read from real UploadedFile objects
+    try:
+        data = file_obj.getvalue()  # UploadedFile supports this
+    except Exception:
+        # Some file-like objects support read()
         try:
-            st.session_state[state_key] = file_obj.getvalue()
+            data = file_obj.read()
         except Exception:
-            if hasattr(file_obj, "seek"):
-                try:
-                    file_obj.seek(0)
-                except Exception:
-                    pass
-            st.session_state[state_key] = file_obj.read()
-        return io.BytesIO(st.session_state[state_key])
+            # Not readable (or was deleted mid-run)
+            st.session_state.pop(state_key, None)
+            return None
 
-    # Nothing new passed in—reuse previously stored bytes if present
-    if state_key in st.session_state:
-        return io.BytesIO(st.session_state[state_key])
-    return None
-
+    st.session_state[state_key] = data
+    return data
 
 def lvb_df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
@@ -469,8 +626,12 @@ def main():
         live_raw = lvb_read_csv_file(live_file)
         back_raw = lvb_read_csv_file(back_file)
 
+        # Debug panel (expand to see YAML path, rules, and matching)
+
         live_norm = lvb_normalize_live(live_raw)
         back_norm = lvb_normalize_backtest(back_raw)
+
+        # st.write("Backtest mapped strategies:", sorted(back_norm["StrategyMapped"].unique()))
 
         start_date, end_date = st.session_state.lv_start_date, st.session_state.lv_end_date
 
