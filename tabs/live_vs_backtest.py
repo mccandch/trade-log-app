@@ -230,9 +230,23 @@ def lvb_read_csv_file(uploaded) -> pd.DataFrame:
     if uploaded is None:
         return pd.DataFrame()
 
+    def _read(source):
+        # Peek at header to learn expected column count
+        header_line = pd.read_csv(source, nrows=0)
+        ncols = len(header_line.columns)
+        # Reset source for full read
+        if hasattr(source, "seek"):
+            source.seek(0)
+        # Truncate rows that have extra fields instead of skipping them
+        return pd.read_csv(
+            source,
+            engine="python",
+            on_bad_lines=lambda cols: cols[:ncols],
+        )
+
     # ✅ handle cached bytes
     if isinstance(uploaded, (bytes, bytearray, memoryview)):
-        return pd.read_csv(io.BytesIO(bytes(uploaded)))
+        return _read(io.BytesIO(bytes(uploaded)))
 
     # ✅ handle UploadedFile / file-like
     if hasattr(uploaded, "seek"):
@@ -240,7 +254,7 @@ def lvb_read_csv_file(uploaded) -> pd.DataFrame:
             uploaded.seek(0)
         except Exception:
             pass
-    return pd.read_csv(uploaded)
+    return _read(uploaded)
 
 def lvb_persist_upload_bytes(file_obj, state_key: str):
     """
@@ -301,6 +315,11 @@ def lvb_live_side_from_tradetype(trade_type: str) -> Optional[str]:
 def lvb_robust_side_from_text(s: str) -> Optional[str]:
     s0 = str(s).strip().lower()
     s0 = re.sub(r"\s+", " ", s0)
+    # Handle "calls w put hedge" / "puts w call hedge" patterns:
+    # the first option type before "w" is the primary direction.
+    m = re.search(r"\b(call|put)s?\s+w\b", s0)
+    if m:
+        return "Call" if m.group(1) == "call" else "Put"
     if ("ccs" in s0) or ("bearish" in s0) or re.search(r"\bcall(s)?\b", s0):
         return "Call"
     if ("pcs" in s0) or ("bullish" in s0) or re.search(r"\bput(s)?\b", s0):
@@ -334,7 +353,23 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
     df["StrategyMapped"] = mapped.apply(lambda t: t[0])
     df["IgnoreFlag"] = mapped.apply(lambda t: t[1])
     df = df[~df["IgnoreFlag"]].copy()
-    df["Side"] = df["Strategy"].apply(lvb_robust_side_from_text)
+
+    def _side_from_legs(legs: str) -> Optional[str]:
+        """Derive Side from the Legs column (e.g. 'P STO' → Put, 'C STO' → Call)."""
+        s = str(legs)
+        if re.search(r"\bC\s+STO\b", s):
+            return "Call"
+        if re.search(r"\bP\s+STO\b", s):
+            return "Put"
+        return None
+
+    if "Legs" in df.columns:
+        df["Side"] = df["Legs"].apply(_side_from_legs)
+        # Fall back to strategy name where Legs didn't resolve
+        mask = df["Side"].isna()
+        df.loc[mask, "Side"] = df.loc[mask, "Strategy"].apply(lvb_robust_side_from_text)
+    else:
+        df["Side"] = df["Strategy"].apply(lvb_robust_side_from_text)
 
     def _num(s: pd.Series) -> pd.Series:
         return pd.to_numeric(

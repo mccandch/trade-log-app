@@ -20,6 +20,19 @@ rules:
     regex: true
 
   # =========================
+  # EMA-VWAP additional mappings
+  # =========================
+  - source: backtest
+    match: '^EMA-V:\s*5 minute calls w put hedge'
+    canonical: "EMA-VWAP"
+    regex: true
+
+  - source: backtest
+    match: '^EMA-V:\s*5 minute puts w call hedge'
+    canonical: "EMA-VWAP"
+    regex: true
+
+  # =========================
   # EMA-T unify (anything containing EMA-T, case-insensitive)
   # =========================
   - source: backtest
