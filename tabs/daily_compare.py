@@ -541,6 +541,7 @@ def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
           .sort_values("Day")
     )
     daily["CumPnL"] = daily["PnL"].cumsum()
+    daily["DayLabel"] = daily["Day"].dt.strftime("%a %b %d")
 
     if daily.empty:
         st.caption("No time series to chart.")
@@ -550,10 +551,10 @@ def _pnl_line_chart(trades: pd.DataFrame, title: str = "PnL over time"):
         alt.Chart(daily)
         .mark_line(point=True)
         .encode(
-            x=alt.X("Day:T", title="Day"),
+            x=alt.X("DayLabel:N", title="Day", sort=None),
             y=alt.Y("CumPnL:Q", title="Cumulative PnL ($)"),
             tooltip=[
-                alt.Tooltip("Day:T", title="Day"),
+                alt.Tooltip("DayLabel:N", title="Day"),
                 alt.Tooltip("PnL:Q", title="Daily PnL ($)", format=",.2f"),
                 alt.Tooltip("CumPnL:Q", title="Cum PnL ($)", format=",.2f"),
             ],
