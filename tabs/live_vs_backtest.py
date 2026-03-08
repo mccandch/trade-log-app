@@ -347,7 +347,7 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
     else:
         df["OpenDT"] = pd.to_datetime(df.get("Date Opened"), errors="coerce")
 
-    df["PnL_rounded"] = df["PnL_gross"]
+    df["PnL_rounded"] = df["PnL_stats"]
 
     # Split combined-leg rows (e.g. iron condors with both C STO and P STO)
     # into separate Call and Put rows so each side can match independently.
