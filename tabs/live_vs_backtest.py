@@ -20,12 +20,6 @@ color_scale = alt.Scale(
     range=["#FFFFFF", "#B8A15A"]   # Live=white, Backtest=muted gold
 )
 
-def _rerun():
-    try:
-        st.experimental_rerun()
-    except Exception:
-        st.rerun()
-
 
 # ---------------- Strategy mapping (YAML + fallback) ----------------
 @st.cache_resource(show_spinner=False)
@@ -152,77 +146,6 @@ def lvb_map_strategy_name(source: str, raw_name: str) -> Tuple[str, bool]:
     st.session_state["__lvb_last_map_result"] = {"type": "none", "canonical": raw, "ignore": False}
     return raw, False
 
-
-
-
-
-# ---------------- Strategy mapping debug helpers ----------------
-# def lvb_mapping_debug_controls():
-#     """
-#     Drop this into the UI to reload strategy_mapping.yaml without restarting Streamlit.
-#     """
-#     col_a, col_b = st.columns([1, 2])
-#     with col_a:
-#         if st.button("Reload strategy mapping", key="lvb_reload_mapping"):
-#             st.session_state["__lvb_cache_bust"] = int(st.session_state.get("__lvb_cache_bust", 0)) + 1
-#             st.cache_resource.clear()
-#             st.rerun()
-#     with col_b:
-#         path = st.session_state.get("__lvb_yaml_path")
-#         loaded = st.session_state.get("__lvb_yaml_loaded")
-#         counts = st.session_state.get("__lvb_rule_counts")
-#         if loaded is not None:
-#             st.caption(f"Loaded={loaded} | path={path} | rules={counts}")
-
-
-# # def lvb_debug_strategy_mapping_panel(live_raw: pd.DataFrame, back_raw: pd.DataFrame):
-#     """
-#     Expander panel that shows:
-#       - YAML path loaded (or fallback)
-#       - rule counts (exact vs regex)
-#       - raw strategy uniques with repr() (so whitespace is visible)
-#       - mapped uniques
-#       - unchanged values (the ones that aren't matching any rule)
-#     """
-#     with st.expander("🔧 Debug: Strategy mapping", expanded=False):
-#         st.write("YAML loaded:", st.session_state.get("__lvb_yaml_loaded"))
-#         st.write("YAML path:", st.session_state.get("__lvb_yaml_path"))
-#         st.write("YAML error:", st.session_state.get("__lvb_yaml_error"))
-#         st.write("Rule counts:", st.session_state.get("__lvb_rule_counts"))
-
-#         # LIVE
-#         if isinstance(live_raw, pd.DataFrame) and "Strategy" in live_raw.columns:
-#             live_uni = sorted(set(live_raw["Strategy"].dropna().astype(str).unique()))
-#             st.write("LIVE unique Strategy values (repr):")
-#             st.write([repr(s) for s in live_uni])
-#             live_mapped = sorted(set(lvb_map_strategy_name("live", s)[0] for s in live_uni))
-#             st.write("LIVE mapped uniques:")
-#             st.write(live_mapped)
-#         else:
-#             st.warning("Live data has no 'Strategy' column.")
-
-#         # BACKTEST
-#         if isinstance(back_raw, pd.DataFrame) and "Strategy" in back_raw.columns:
-#             back_uni = sorted(set(back_raw["Strategy"].dropna().astype(str).unique()))
-#             st.write("BACKTEST unique Strategy values (repr):")
-#             st.write([repr(s) for s in back_uni])
-#             back_mapped = sorted(set(lvb_map_strategy_name("backtest", s)[0] for s in back_uni))
-#             st.write("BACKTEST mapped uniques:")
-#             st.write(back_mapped)
-
-#             unchanged = sorted([s for s in back_uni if lvb_map_strategy_name("backtest", s)[0] == s])
-#             st.write("BACKTEST unchanged by mapping (repr):")
-#             st.write([repr(s) for s in unchanged])
-
-#             rules = lvb_load_strategy_rules(int(st.session_state.get("__lvb_cache_bust", 0)))
-#             patt_list = [p.pattern for p, _, _ in rules["patterns"]["backtest"]]
-#             st.write("BACKTEST regex patterns loaded:")
-#             st.write(patt_list)
-#         else:
-#             st.warning("Backtest data has no 'Strategy' column.")
-
-#         st.write("Last mapping attempt:", st.session_state.get("__lvb_last_map"))
-#         st.write("Last mapping result:", st.session_state.get("__lvb_last_map_result"))
 
 # ---------------- IO helpers ----------------
 @st.cache_data(show_spinner=False)
@@ -562,21 +485,6 @@ def lvb_greedy_match_with_tolerance(live_df: pd.DataFrame, back_df: pd.DataFrame
     return pd.DataFrame(matches, columns=["LiveIdx", "BackIdx"]) if matches else pd.DataFrame(columns=["LiveIdx", "BackIdx"])
 
 
-# ---------------- Styling helpers ----------------
-def lvb_render_table_html(
-    df,
-    currency_cols,
-    percent_cols,
-    posneg_cols,
-    pair_band: bool,
-    band_stride: int,
-) -> str:
-    styler = lvb_style_table_center_currency_percent(
-        df, currency_cols, percent_cols, posneg_cols, pair_band, band_stride
-    ).set_table_attributes('class="compact-table"')
-    return styler.to_html()
-
-
 def lvb_style_table_center_currency_percent(
     df: pd.DataFrame,
     currency_cols: List[str],
@@ -749,12 +657,8 @@ def main():
         live_raw = lvb_read_csv_file(live_file)
         back_raw = lvb_read_csv_file(back_file)
 
-        # Debug panel (expand to see YAML path, rules, and matching)
-
         live_norm = lvb_normalize_live(live_raw)
         back_norm = lvb_normalize_backtest(back_raw)
-
-        # st.write("Backtest mapped strategies:", sorted(back_norm["StrategyMapped"].unique()))
 
         start_date, end_date = st.session_state.lv_start_date, st.session_state.lv_end_date
 
@@ -1050,19 +954,18 @@ def main():
             opposite = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LivePnL","BackPnL"])
 
         st.markdown("### Detail Tables")
-        with st.expander("Trades only in Live (after tolerance match)"):
+        live_only_pnl = pd.to_numeric(live_only.get("PnL_rounded", 0), errors="coerce").sum()
+        back_only_pnl = pd.to_numeric(back_only.get("PnL_rounded", 0), errors="coerce").sum()
+        with st.expander(f"Trades only in Live (after tolerance match) — PnL: ${live_only_pnl:,.2f}"):
             st.markdown(lvb_render_table_html(live_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
-        with st.expander("Trades only in Backtest (after tolerance match)"):
+        with st.expander(f"Trades only in Backtest (after tolerance match) — PnL: ${back_only_pnl:,.2f}"):
             st.markdown(lvb_render_table_html(back_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
         with st.expander("Matched pairs with opposite outcomes"):
             opp_display = opposite.drop(columns=[c for c in ["LiveIdx","BackIdx"] if c in opposite.columns])
             st.markdown(lvb_render_table_html(opp_display, [], [], ["LivePnL","BackPnL"], True, 1), unsafe_allow_html=True)
         with st.expander("All matched pairs (details)"):
-            pairs_display = matched_pairs.drop(columns=[c for c in ["LiveIdx","BackIdx"] if c in matched_pairs.columns])
+            pairs_display = matched_pairs.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in matched_pairs.columns])
             pairs_display = pairs_display.sort_values(["Strategy", "OpenDT_Live", "Side"]).reset_index(drop=True)
-            # Show match summary
-            _mc = pairs_display.groupby(["Strategy", "Side"]).size().reset_index(name="Matches")
-            st.table(_mc)
             st.markdown(lvb_render_table_html(pairs_display, [], [], ["LivePnL","BackPnL"], True, 2), unsafe_allow_html=True)
 
         st.markdown("### Downloads")
