@@ -961,7 +961,7 @@ def main():
         with st.expander(f"Trades only in Backtest (after tolerance match) — PnL: ${back_only_pnl:,.2f}"):
             st.markdown(lvb_render_table_html(back_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
         with st.expander("Matched pairs with opposite outcomes"):
-            opp_display = opposite.drop(columns=[c for c in ["LiveIdx","BackIdx"] if c in opposite.columns])
+            opp_display = opposite.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in opposite.columns])
             st.markdown(lvb_render_table_html(opp_display, [], [], ["LivePnL","BackPnL"], True, 1), unsafe_allow_html=True)
         with st.expander("All matched pairs (details)"):
             pairs_display = matched_pairs.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in matched_pairs.columns])
