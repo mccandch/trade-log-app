@@ -355,11 +355,15 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
     df = df[~df["IgnoreFlag"]].copy()
 
     def _side_from_legs(legs: str) -> Optional[str]:
-        """Derive Side from the Legs column (e.g. 'P STO' → Put, 'C STO' → Call)."""
+        """Derive Side from the Legs column (e.g. 'P STO' → Put, 'C STO' → Call).
+        Returns None when both sides are present (combined legs like iron condors)
+        so the row can be split later."""
         s = str(legs)
-        if re.search(r"\bC\s+STO\b", s):
+        has_call = bool(re.search(r"\bC\s+STO\b", s))
+        has_put = bool(re.search(r"\bP\s+STO\b", s))
+        if has_call and not has_put:
             return "Call"
-        if re.search(r"\bP\s+STO\b", s):
+        if has_put and not has_call:
             return "Put"
         return None
 
@@ -421,6 +425,50 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
         df["OpenDT"] = pd.to_datetime(df.get("Date Opened"), errors="coerce")
 
     df["PnL_rounded"] = df["PnL_gross"]
+
+    # Split combined-leg rows (e.g. iron condors with both C STO and P STO)
+    # into separate Call and Put rows so each side can match independently.
+    if "Legs" in df.columns:
+        _legs = df["Legs"].astype(str)
+        _has_c = _legs.str.contains(r"\bC\s+STO\b", regex=True, na=False)
+        _has_p = _legs.str.contains(r"\bP\s+STO\b", regex=True, na=False)
+        _combined = _has_c & _has_p
+        if _combined.any():
+            new_rows = []
+            for idx in df.index[_combined]:
+                row = df.loc[idx]
+                parts = [l.strip() for l in str(row["Legs"]).split("|")]
+                call_parts = [l for l in parts if re.search(r"\bC\s+(STO|BTO)\b", l)]
+                put_parts  = [l for l in parts if re.search(r"\bP\s+(STO|BTO)\b", l)]
+
+                def _side_prem(legs):
+                    cr, q = 0.0, 1
+                    for lg in legs:
+                        m = re.match(r"(\d+)\s+", lg)
+                        if m:
+                            q = max(q, int(m.group(1)))
+                        for p in re.findall(r"STO\s+([0-9]*\.?[0-9]+)", lg):
+                            cr += float(p)
+                        for p in re.findall(r"BTO\s+([0-9]*\.?[0-9]+)", lg):
+                            cr -= float(p)
+                    return cr * q * 100
+
+                cp, pp = _side_prem(call_parts), _side_prem(put_parts)
+                tot = cp + pp
+                cr = (cp / tot) if tot else 0.5
+                pr = (pp / tot) if tot else 0.5
+
+                for side, legs_list, ratio in [("Call", call_parts, cr), ("Put", put_parts, pr)]:
+                    nr = row.copy()
+                    nr["Side"] = side
+                    nr["Legs"] = " | ".join(legs_list)
+                    nr["PremiumSold"] = round(float(row.get("PremiumSold", 0)) * ratio, 2)
+                    for c in ("PnL_stats", "PnL_gross", "PnL_rounded"):
+                        if c in nr.index and pd.notna(row.get(c)):
+                            nr[c] = round(float(row[c]) * ratio, 2)
+                    new_rows.append(nr)
+            df = pd.concat([df[~_combined], pd.DataFrame(new_rows)], ignore_index=True)
+
     return df
 
 
@@ -452,25 +500,65 @@ def lvb_compute_strategy_stats(df: pd.DataFrame, strat_col: str = "StrategyKey",
 def lvb_greedy_match_with_tolerance(live_df: pd.DataFrame, back_df: pd.DataFrame, tol_minutes: int) -> pd.DataFrame:
     from datetime import timedelta
     tol = timedelta(minutes=tol_minutes)
-    matches = []
-    keys = sorted(set(zip(live_df["StrategyMapped"], live_df["Side"])))
-    back_unused = set(back_df.index)
+    matches = []          # list of (live_orig_idx, back_orig_idx)
+    live_used = set()     # original live indices already consumed
+    back_used = set()     # original back indices already consumed
+
+    def _greedy(l_rows, b_rows):
+        """Greedy nearest-match: for each live row (sorted), find closest
+        unused backtest row within tolerance. Both inputs are lists of
+        (orig_idx, OpenDT) tuples, pre-sorted by OpenDT."""
+        b_start = 0
+        for l_idx, dt_l in l_rows:
+            if l_idx in live_used or pd.isna(dt_l):
+                continue
+            best_b = None
+            best_delta = None
+            for k in range(b_start, len(b_rows)):
+                b_idx, dt_b = b_rows[k]
+                if b_idx in back_used or pd.isna(dt_b):
+                    continue
+                delta = abs(dt_l - dt_b)
+                if delta <= tol:
+                    if best_delta is None or delta < best_delta:
+                        best_b = b_idx
+                        best_delta = delta
+                elif dt_b > dt_l + tol:
+                    break
+            if best_b is not None:
+                matches.append((l_idx, best_b))
+                live_used.add(l_idx)
+                back_used.add(best_b)
+                # slide window past consumed entries at front
+                while b_start < len(b_rows) and b_rows[b_start][0] in back_used:
+                    b_start += 1
+
+    def _to_pairs(df):
+        """Convert df to list of (orig_index, OpenDT) sorted by OpenDT."""
+        sub = df[["OpenDT"]].copy()
+        sub = sub.sort_values("OpenDT")
+        return list(zip(sub.index, sub["OpenDT"]))
+
+    # ── Pass 1: exact (Strategy, Side) match ──
+    live_keys = set(zip(live_df["StrategyMapped"], live_df["Side"]))
+    back_keys = set(zip(back_df["StrategyMapped"], back_df["Side"]))
+    keys = sorted((s, sd) for s, sd in live_keys | back_keys if pd.notna(sd))
+
     for strat, side in keys:
-        L = live_df[(live_df["StrategyMapped"] == strat) & (live_df["Side"] == side)].sort_values("OpenDT")
-        B = back_df[(back_df["StrategyMapped"] == strat) & (back_df["Side"] == side)].sort_values("OpenDT")
-        if L.empty or B.empty:
-            continue
-        i = j = 0
-        L_idx, B_idx = L.index.to_list(), B.index.to_list()
-        while i < len(L_idx) and j < len(B_idx):
-            li, bj = L_idx[i], B_idx[j]
-            if bj not in back_unused:
-                j += 1; continue
-            dt_l, dt_b = L.at[li, "OpenDT"], B.at[bj, "OpenDT"]
-            if abs(dt_l - dt_b) <= tol:
-                matches.append((li, bj)); back_unused.remove(bj); i += 1; j += 1
-            else:
-                i += (dt_l < dt_b); j += (dt_b <= dt_l)
+        L = live_df[(live_df["StrategyMapped"] == strat) & (live_df["Side"] == side)]
+        B = back_df[(back_df["StrategyMapped"] == strat) & (back_df["Side"] == side)]
+        if not L.empty and not B.empty:
+            _greedy(_to_pairs(L), _to_pairs(B))
+
+    # ── Pass 2: strategy-only fallback for remaining unmatched trades ──
+    remaining = live_df[~live_df.index.isin(live_used)]
+    if not remaining.empty:
+        for strat in sorted(remaining["StrategyMapped"].dropna().unique()):
+            L = remaining[remaining["StrategyMapped"] == strat]
+            B = back_df[(back_df["StrategyMapped"] == strat) & ~back_df.index.isin(back_used)]
+            if not L.empty and not B.empty:
+                _greedy(_to_pairs(L), _to_pairs(B))
+
     return pd.DataFrame(matches, columns=["LiveIdx", "BackIdx"]) if matches else pd.DataFrame(columns=["LiveIdx", "BackIdx"])
 
 
@@ -931,6 +1019,8 @@ def main():
 
         # Tolerance matching + detail tables
         matches = lvb_greedy_match_with_tolerance(live_sel, back_sel, st.session_state.tol_minutes)
+
+
         if matches.empty:
             matched_pairs = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LivePnL","BackPnL"])
             live_only = live_sel.copy(); back_only = back_sel.copy()
@@ -969,7 +1059,11 @@ def main():
             st.markdown(lvb_render_table_html(opp_display, [], [], ["LivePnL","BackPnL"], True, 1), unsafe_allow_html=True)
         with st.expander("All matched pairs (details)"):
             pairs_display = matched_pairs.drop(columns=[c for c in ["LiveIdx","BackIdx"] if c in matched_pairs.columns])
-            st.markdown(lvb_render_table_html(pairs_display, [], [], ["LivePnL","BackPnL"], True, 1), unsafe_allow_html=True)
+            pairs_display = pairs_display.sort_values(["Strategy", "OpenDT_Live", "Side"]).reset_index(drop=True)
+            # Show match summary
+            _mc = pairs_display.groupby(["Strategy", "Side"]).size().reset_index(name="Matches")
+            st.table(_mc)
+            st.markdown(lvb_render_table_html(pairs_display, [], [], ["LivePnL","BackPnL"], True, 2), unsafe_allow_html=True)
 
         st.markdown("### Downloads")
         c1, c2, c3, c4 = st.columns(4)
