@@ -650,6 +650,16 @@ def main():
         live_file = lvb_persist_upload_bytes(st.session_state.get("live_csv"), "_live_bytes")
         back_file = lvb_persist_upload_bytes(st.session_state.get("back_csv"), "_back_bytes")
 
+        # Fall back to default CSV files on disk if no upload provided
+        if live_file is None:
+            default_live = Path(__file__).parent.parent / "Live trade log.csv"
+            if default_live.exists():
+                live_file = default_live.read_bytes()
+        if back_file is None:
+            default_back = Path(__file__).parent.parent / "Backtest Portfolio Trade Log.csv"
+            if default_back.exists():
+                back_file = default_back.read_bytes()
+
         if (live_file is None) or (back_file is None):
             st.info("Upload both CSVs to begin.")
             return
