@@ -838,8 +838,8 @@ def main():
                 g = ts.groupby(["Source", "Date"])
 
                 if series_key == "cum_pnl":
-                    daily = g["PnL_stats"].sum().reset_index(name="Value")
-                    daily["Value"] = daily.groupby("Source")["Value"].cumsum()
+                    daily = g["PnL_stats"].sum().reset_index(name="DailyValue")
+                    daily["Value"] = daily.groupby("Source")["DailyValue"].cumsum()
                 elif series_key == "daily_trades":
                     daily = g.size().reset_index(name="Value")
                 elif series_key == "daily_pcr":
@@ -862,6 +862,10 @@ def main():
                             alt.Tooltip("Date:T", title="Date"),
                             "Source:N",
                             alt.Tooltip("Value:Q", title=y_title, format=y_fmt),
+                            *(
+                                [alt.Tooltip("DailyValue:Q", title="Daily Premium Captured ($)", format="$,.0f")]
+                                if series_key == "cum_pnl" else []
+                            ),
                         ],
                     )
                     .properties(height=250)
@@ -951,6 +955,8 @@ def main():
             # Use unified stats PnL (net when available, else gross), then round once
             matched_pairs["LivePnL"] = matched_pairs["LiveIdx"].map(live_sel["PnL_stats"]).round(2)
             matched_pairs["BackPnL"] = matched_pairs["BackIdx"].map(back_sel["PnL_stats"]).round(2)
+            matched_pairs["LivePremium"] = matched_pairs["LiveIdx"].map(live_sel["PremiumSold"]).round(2)
+            matched_pairs["BackPremium"] = matched_pairs["BackIdx"].map(back_sel["PremiumSold"]).round(2)
             
         if not matches.empty:
             EPS = 0.01  # treat +/- 1 cent as flat
@@ -961,7 +967,11 @@ def main():
             matched_pairs["BackSign"] = _sign(matched_pairs["BackPnL"])
             opposite = matched_pairs[(matched_pairs["LiveSign"] * matched_pairs["BackSign"]) == -1].copy()
         else:
-            opposite = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LivePnL","BackPnL"])
+            opposite = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LivePnL","BackPnL","LivePremium","BackPremium"])
+
+        opp_live_pnl = pd.to_numeric(opposite.get("LivePnL", pd.Series(dtype=float)), errors="coerce").sum()
+        opp_back_pnl = pd.to_numeric(opposite.get("BackPnL", pd.Series(dtype=float)), errors="coerce").sum()
+        opp_pnl_diff = opp_live_pnl - opp_back_pnl
 
         st.markdown("### Detail Tables")
         live_only_pnl = pd.to_numeric(live_only.get("PnL_rounded", 0), errors="coerce").sum()
@@ -970,10 +980,13 @@ def main():
             st.markdown(lvb_render_table_html(live_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
         with st.expander(f"Trades only in Backtest (after tolerance match) — PnL: ${back_only_pnl:,.2f}"):
             st.markdown(lvb_render_table_html(back_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
-        with st.expander("Matched pairs with opposite outcomes"):
+        with st.expander(f"Matched pairs with opposite outcomes — Live PnL: ${opp_live_pnl:,.2f} | Backtest PnL: ${opp_back_pnl:,.2f} | Diff: ${opp_pnl_diff:,.2f}"):
             opp_display = opposite.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in opposite.columns])
             st.markdown(lvb_render_table_html(opp_display, [], [], ["LivePnL","BackPnL"], True, 1), unsafe_allow_html=True)
-        with st.expander("All matched pairs (details)"):
+        all_live_pnl = pd.to_numeric(matched_pairs.get("LivePnL", pd.Series(dtype=float)), errors="coerce").sum()
+        all_back_pnl = pd.to_numeric(matched_pairs.get("BackPnL", pd.Series(dtype=float)), errors="coerce").sum()
+        all_pnl_diff = all_live_pnl - all_back_pnl
+        with st.expander(f"All matched pairs (details) — Live PnL: ${all_live_pnl:,.2f} | Backtest PnL: ${all_back_pnl:,.2f} | Diff: ${all_pnl_diff:,.2f}"):
             pairs_display = matched_pairs.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in matched_pairs.columns])
             pairs_display = pairs_display.sort_values(["Strategy", "OpenDT_Live", "Side"]).reset_index(drop=True)
             st.markdown(lvb_render_table_html(pairs_display, [], [], ["LivePnL","BackPnL"], True, 2), unsafe_allow_html=True)
