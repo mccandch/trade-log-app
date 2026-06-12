@@ -217,10 +217,9 @@ def open_sheet():
     return gc.open(st.secrets["sheets"]["sheet_name"])
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def load_sheets_data() -> pd.DataFrame:
     """Read Raw_* tabs and normalize columns for the app, with per-row User fallback to tab name."""
-    import time
 
     sh = open_sheet()
 
@@ -326,31 +325,7 @@ def load_sheets_data() -> pd.DataFrame:
             frames.append(out)
         return frames
 
-    # Read twice quickly and compare simple signatures to avoid mid-edit races
-    def _signature(frames: list[pd.DataFrame]) -> list[tuple]:
-        sig = []
-        for f in frames:
-            tab = str(f["__source_tab"].iloc[0]) if not f.empty and "__source_tab" in f.columns else ""
-            prem = float(pd.to_numeric(f.get("Premium", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "Premium" in f.columns else 0.0
-            pnl  = float(pd.to_numeric(f.get("PnL", pd.Series(dtype="float64")), errors="coerce").fillna(0).sum()) if "PnL" in f.columns else 0.0
-            sig.append((tab, len(f), round(prem, 2), round(pnl, 2)))
-        sig.sort(key=lambda x: x[0])
-        return sig
-
-    frames_final: list[pd.DataFrame] = []
-    last_frames: list[pd.DataFrame] = []
-    for _ in range(5):
-        f1 = _read_all_raw_tabs()
-        s1 = _signature(f1)
-        time.sleep(0.7)
-        f2 = _read_all_raw_tabs()
-        s2 = _signature(f2)
-        if s1 == s2:
-            frames_final = f2
-            break
-        last_frames = f2
-    else:
-        frames_final = last_frames
+    frames_final = _read_all_raw_tabs()
 
     if not frames_final:
         return pd.DataFrame(

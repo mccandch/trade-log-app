@@ -137,7 +137,7 @@ def pull_trades_df(con: sqlite3.Connection) -> pd.DataFrame:
     """
     Pull trades within LOOKBACK_DAYS from DB for USER_NAME.
     Expected tables/columns:
-      Trade(TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen)
+      Trade(TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day)
       OrderLeg(OrderID, PutCall, Strike, Qty)
     """
     cur = con.cursor()
@@ -149,20 +149,28 @@ def pull_trades_df(con: sqlite3.Connection) -> pd.DataFrame:
 
     q = (
         """
-        SELECT TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen
+        SELECT TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day
         FROM Trade
-        WHERE DateOpened >= ?
+        WHERE DateOpened >= ? OR (Year IS NOT NULL AND Year * 10000 + Month * 100 + Day >= ?)
         ORDER BY TradeID ASC
         """
     )
-    rows = cur.execute(q, (cutoff_ticks,)).fetchall()
+    cutoff_dt_naive = cutoff_dt.replace(tzinfo=None)
+    cutoff_ymd = cutoff_dt_naive.year * 10000 + cutoff_dt_naive.month * 100 + cutoff_dt_naive.day
+    rows = cur.execute(q, (cutoff_ticks, cutoff_ymd)).fetchall()
 
     items = []
     src = os.path.basename(DB_PATH)
-    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen in rows:
+    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day in rows:
         if not accounts_ok(Account):
             continue
         dt = ticks_to_dt_utc(DateOpened)
+        # Fallback: when DateOpened is the sentinel (trade pending fill), use Year/Month/Day
+        if dt is None and Year and Month and Day:
+            try:
+                dt = datetime(int(Year), int(Month), int(Day), 9, 30, 0, tzinfo=timezone.utc)
+            except Exception:
+                pass
         right, strike = pick_short_leg(cur, OrderIDOpen)
         batch_id = f"db-{USER_NAME}-{dt.date().isoformat()}" if dt else None
 
@@ -315,7 +323,7 @@ def run_once():
         traceback.print_exc()
 
 def main():
-    print(f"History-preserving true sync for {USER_NAME} → tab '{TAB_PREFIX}{USER_NAME}'. Ctrl+C to stop.", flush=True)
+    print(f"History-preserving true sync for {USER_NAME} -> tab '{TAB_PREFIX}{USER_NAME}'. Ctrl+C to stop.", flush=True)
     if POLL_SECONDS and POLL_SECONDS > 0:
         while True:
             run_once()
