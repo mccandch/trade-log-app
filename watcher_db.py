@@ -295,8 +295,6 @@ def sync_tab(ws) -> None:
     ensure_header(ws)  # ensure header row is correct
     final = history_preserving_merge(ws, db_df)
 
-    # Clear + rewrite (history preserved via the merge)
-    ws.clear()
     set_with_dataframe(
         ws, final.fillna(""),
         include_index=False,
