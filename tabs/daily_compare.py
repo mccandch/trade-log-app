@@ -242,7 +242,11 @@ def load_sheets_data() -> pd.DataFrame:
             if not title.startswith("Raw_"):
                 continue
 
-            df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how="all")
+            try:
+                df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how="all")
+            except Exception as e:
+                st.warning(f"Could not read tab '{title}': {e}")
+                continue
             if df.empty:
                 continue
 
@@ -1109,15 +1113,17 @@ def daily_compare_tab():
     view = df[(df["Date"] >= d1) & (df["Date"] <= d2)].copy()
 
     users_in_view = view["User"].dropna().unique().tolist()
+    all_users = df["User"].dropna().unique().tolist()
     preferred_user_order = ["Chad", "Kelly", "Salah"]
-    ordered_users = [u for u in preferred_user_order if u in users_in_view] + \
-                    [u for u in sorted(users_in_view) if u not in preferred_user_order]
+    ordered_users = [u for u in preferred_user_order if u in all_users] + \
+                    [u for u in sorted(all_users) if u not in preferred_user_order]
+    default_users = [u for u in ordered_users if u in users_in_view]
 
     if not ordered_users:
         st.warning("Nobody placed any trades for the selected date range.")
         st.stop()
 
-    users = st.multiselect("Users to display", options=ordered_users, default=ordered_users, key="dc_user_filter")
+    users = st.multiselect("Users to display", options=ordered_users, default=default_users, key="dc_user_filter")
     if not users:
         st.caption("No users selected.")
         return
