@@ -42,11 +42,23 @@ HEADER = [
 
 # ----------------- Helpers -----------------
 def ticks_to_dt_utc(ticks: Optional[int]) -> Optional[datetime]:
-    """Convert .NET ticks to aware UTC datetime (or None)."""
+    """Convert .NET ticks to aware UTC datetime (or None).
+
+    Pending/unfilled trades are stamped with .NET's DateTime.MaxValue
+    (ticks == 3155378975999999999) as a sentinel. That value round-trips
+    fine through Python's datetime (year 9999 is valid), so callers can't
+    tell it apart from a real date -- it has to be caught here so the
+    Year/Month/Day fallback in pull_trades_df() kicks in instead. Without
+    this, the sentinel date overflows pandas' Timestamp range downstream
+    and silently turns into NaT, dropping the trade from the app entirely.
+    """
     if ticks in (None, ""):
         return None
     try:
-        sec = (int(ticks) - 621355968000000000) / 10_000_000
+        ticks = int(ticks)
+        if ticks >= 3155378975000000000:
+            return None
+        sec = (ticks - 621355968000000000) / 10_000_000
         return datetime.fromtimestamp(sec, timezone.utc)
     except Exception:
         return None
