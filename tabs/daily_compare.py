@@ -1123,7 +1123,17 @@ def daily_compare_tab():
         st.warning("Nobody placed any trades for the selected date range.")
         st.stop()
 
-    users = st.multiselect("Users to display", options=ordered_users, default=default_users, key="dc_user_filter")
+    # st.multiselect only honors `default` the first time its `key` is set in
+    # session_state; once a selection exists, later reruns keep reusing it even
+    # if the date range or the set of users with data changes. Force a reset
+    # whenever either of those inputs changes so a user who reappears (or a new
+    # date range) isn't silently left out of the selection.
+    filter_signature = (d1, d2, tuple(default_users))
+    if st.session_state.get("dc_user_filter_sig") != filter_signature:
+        st.session_state["dc_user_filter"] = default_users
+        st.session_state["dc_user_filter_sig"] = filter_signature
+
+    users = st.multiselect("Users to display", options=ordered_users, key="dc_user_filter")
     if not users:
         st.caption("No users selected.")
         return
