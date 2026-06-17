@@ -311,60 +311,69 @@ def _init_state_from_df(final: pd.DataFrame) -> None:
 # ================== SYNC FUNCTIONS ==================
 
 def full_sync(ws) -> None:
-    """Full reconciliation: read sheet history, merge with DB window, rewrite sheet.
+    """Append any DB rows that are missing from the sheet. Never bulk-overwrites.
 
-    Write strategy: resize → overwrite rows in place (no clear) → trim old tail.
-    ws.clear() triggers Google Sheets' automatic data-restore: if the sheet is open
-    in a browser and all content is deleted, Google restores the previous version
-    within ~6 seconds. To avoid this, we overwrite existing rows in place using
-    ws.update() with explicit ranges, then clear only the tail rows that exceed the
-    new data length.
+    Google Sheets auto-reverts any large write operation (update, clear, batch_clear)
+    when the sheet is open in a browser — it restores the previous version within
+    seconds. The only safe write operation is append_rows, which the browser handles
+    as a normal incremental change. So full_sync now works like a catch-up incremental:
+    find which TradeIDs are absent from the sheet, append only those rows.
     """
     global _last_full_sync
     with sqlite3.connect(DB_PATH) as con:
         db_df = pull_trades_df(con, days=LOOKBACK_DAYS)
-    final = history_preserving_merge(ws, db_df)
 
-    data_rows = []
-    for _, row in final.iterrows():
-        data_rows.append(_row_vals(row.to_dict()))
+    # Read the sheet as it actually exists right now.
+    sheet_df = read_sheet_df(ws)
 
-    n_data = len(data_rows)
-    needed = n_data + 1 + 500  # header + data + buffer
-    all_values = [HEADER] + data_rows  # header at row 1, data at rows 2..n_data+1
-
-    print(f"  full_sync: {n_data} data rows", flush=True)
-
-    ws.resize(rows=needed, cols=len(HEADER))
-
-    try:
-        ws.freeze(rows=1)
-    except Exception:
-        pass
-
-    # Overwrite rows in place using explicit ranges — no clear().
-    # ws.clear() triggers Google Sheets' automatic version restore within ~6 seconds
-    # when the sheet is open in a browser, silently undoing all subsequent writes.
-    _CHUNK = 1000
-    for i in range(0, len(all_values), _CHUNK):
-        chunk = all_values[i : i + _CHUNK]
-        start_row = i + 1
-        end_row = start_row + len(chunk) - 1
-        ws.update(values=chunk, range_name=f"A{start_row}:{_COL_END}{end_row}",
-                  value_input_option="USER_ENTERED")
-
-    # Clear stale tail rows if data shrank since the last sync.
-    new_data_end = n_data + 1
-    if ws.row_count > new_data_end + 50:
-        tail_range = f"A{new_data_end + 1}:{_COL_END}{ws.row_count}"
+    # Ensure the sheet has a header row.
+    first_row = ws.row_values(1) if ws.row_count > 0 else []
+    if not first_row or first_row[0] != HEADER[0]:
+        ws.update(values=[HEADER], range_name="A1", value_input_option="USER_ENTERED")
         try:
-            ws.batch_clear([tail_range])
+            ws.freeze(rows=1)
         except Exception:
             pass
+        sheet_df = pd.DataFrame(columns=HEADER)
 
-    _init_state_from_df(final)
+    # Determine which TradeIDs are already in the sheet.
+    if "TradeID" in sheet_df.columns and not sheet_df.empty:
+        existing_ids = set(
+            sheet_df["TradeID"].dropna().astype(str).str.strip()
+        ) - {""}
+    else:
+        existing_ids = set()
+
+    # Find DB rows whose TradeID is not yet in the sheet.
+    db_id_col = db_df["TradeID"].astype(str).str.strip()
+    missing_mask = (
+        db_df["TradeID"].notna()
+        & (db_id_col != "")
+        & (~db_id_col.isin(existing_ids))
+    )
+    missing_df = db_df[missing_mask].copy()
+
+    print(
+        f"  full_sync: sheet={len(existing_ids)} known TradeIDs, "
+        f"db={len(db_df)}, appending {len(missing_df)} missing rows",
+        flush=True,
+    )
+
+    if not missing_df.empty:
+        to_append = [_row_vals(r.to_dict()) for _, r in missing_df.iterrows()]
+        # append_rows uses INSERT_ROWS mode and is not bounded by grid size.
+        _CHUNK = 500
+        for i in range(0, len(to_append), _CHUNK):
+            chunk = to_append[i : i + _CHUNK]
+            ws.append_rows(chunk, value_input_option="USER_ENTERED")
+            print(f"    appended rows {i+1}-{i+len(chunk)}", flush=True)
+
+    # Rebuild in-memory state from what the sheet actually contains now.
+    updated_sheet_df = read_sheet_df(ws)
+    _init_state_from_df(updated_sheet_df)
+
     _last_full_sync = datetime.now(timezone.utc)
-    print(f"Full sync: {len(final)} rows to '{ws.title}'.", flush=True)
+    print(f"Full sync complete: {len(updated_sheet_df)} rows in '{ws.title}'.", flush=True)
 
 
 def incremental_sync(ws) -> None:
