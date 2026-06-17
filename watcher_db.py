@@ -322,6 +322,11 @@ def full_sync(ws) -> None:
     for _, row in final.iterrows():
         data_rows.append(_row_vals(row.to_dict()))
 
+    # Pre-expand the grid so append_rows never hits the row ceiling.
+    # ws.resize() works; ws.clear() preserves the new size; append_rows then
+    # writes freely within the expanded grid.
+    needed_rows = len(data_rows) + 1 + 500   # header + data + buffer
+    ws.resize(rows=needed_rows, cols=len(HEADER))
     ws.clear()
     ws.update(values=[HEADER], range_name="A1")
     try:
@@ -329,7 +334,7 @@ def full_sync(ws) -> None:
     except Exception:
         pass
 
-    # Append data in chunks — values.append auto-extends the grid unlike values.update
+    # Append data in chunks within the pre-expanded grid
     _CHUNK = 1000
     for i in range(0, len(data_rows), _CHUNK):
         ws.append_rows(data_rows[i : i + _CHUNK], value_input_option="USER_ENTERED")
