@@ -235,11 +235,16 @@ def load_sheets_data() -> pd.DataFrame:
                 rename_map[c] = "Source"
         return df.rename(columns=rename_map) if rename_map else df
 
+    # Tabs to skip — "Raw_Chad" is maintained by a conflicting external process
+    # that continuously overwrites it with stale 6/11 data. The live data is
+    # written to "Raw_Chad_Live" by the current watcher.
+    _SKIP_TABS = frozenset({"Raw_Chad"})
+
     def _read_all_raw_tabs() -> list[pd.DataFrame]:
         frames: list[pd.DataFrame] = []
         for ws in sh.worksheets():
             title = ws.title or ""
-            if not title.startswith("Raw_"):
+            if not title.startswith("Raw_") or title in _SKIP_TABS:
                 continue
 
             try:
