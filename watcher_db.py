@@ -332,16 +332,19 @@ def full_sync(ws) -> None:
 
     needed = len(data_rows) + 1 + 500  # header + data + buffer
 
-    # Pre-resize: refresh server-side grid and local row_count cache BEFORE writing.
-    # append_rows does not auto-extend past the current grid rowCount; without this,
-    # a stale cached rowCount (e.g. 2739 from before a sheet reset) silently truncates
-    # the write at the old boundary.
-    try:
-        ws.resize(rows=needed, cols=len(HEADER))
-    except Exception:
-        pass
+    print(f"  full_sync: {len(data_rows)} data rows, need grid>={needed}", flush=True)
+    print(f"  ws.row_count before pre-resize: {ws.row_count}", flush=True)
+
+    ws.resize(rows=needed, cols=len(HEADER))
+    print(f"  ws.row_count after pre-resize: {ws.row_count}", flush=True)
 
     ws.clear()
+    # ws.clear() causes Google to auto-trim the server-side grid back to its
+    # previous rowCount (2739 here). Resize again immediately after clear so
+    # the grid is large enough before any data is written.
+    ws.resize(rows=needed, cols=len(HEADER))
+    print(f"  ws.row_count after clear+resize: {ws.row_count}", flush=True)
+
     ws.update(values=[HEADER], range_name="A1")
     try:
         ws.freeze(rows=1)
@@ -350,13 +353,20 @@ def full_sync(ws) -> None:
 
     _CHUNK = 1000
     for i in range(0, len(data_rows), _CHUNK):
-        ws.append_rows(data_rows[i : i + _CHUNK], value_input_option="USER_ENTERED")
+        chunk = data_rows[i : i + _CHUNK]
+        ws.append_rows(chunk, value_input_option="USER_ENTERED")
+        print(f"  appended rows {i+1}-{i+len(chunk)}", flush=True)
 
-    # Post-write resize: re-lock the grid in case Google auto-trimmed it during the write.
+    # Verify actual rows on the sheet (server read, not cached count)
     try:
-        ws.resize(rows=needed, cols=len(HEADER))
-    except Exception:
-        pass
+        col_a = ws.col_values(1)
+        actual_data_rows = len(col_a) - 1
+        print(f"  verified {actual_data_rows} data rows in sheet after write", flush=True)
+    except Exception as e:
+        print(f"  WARNING could not verify row count: {e}", flush=True)
+
+    ws.resize(rows=needed, cols=len(HEADER))
+    print(f"  ws.row_count after final resize: {ws.row_count}", flush=True)
 
     _init_state_from_df(final)
     _last_full_sync = datetime.now(timezone.utc)
