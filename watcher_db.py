@@ -234,6 +234,13 @@ def read_sheet_df(ws) -> pd.DataFrame:
     for c in HEADER:
         if c not in df.columns:
             df[c] = pd.NA
+    # Normalize TradeID: Google Sheets returns integers as floats ("12345.0").
+    # Strip the trailing ".0" so IDs match the DB's integer strings ("12345").
+    if "TradeID" in df.columns:
+        def _norm_tid(v):
+            s = str(v).strip() if v is not None and not (isinstance(v, float) and pd.isna(v)) else ""
+            return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
+        df["TradeID"] = df["TradeID"].apply(_norm_tid)
     return df.reindex(columns=HEADER, fill_value=pd.NA)
 
 
@@ -370,8 +377,20 @@ def full_sync(ws) -> None:
 
     # Rebuild in-memory state from what the sheet actually contains now.
     updated_sheet_df = read_sheet_df(ws)
-    _init_state_from_df(updated_sheet_df)
 
+    # Revert detection: if the sheet has fewer rows than before we started,
+    # an external process cleared our writes. Don't commit this broken state —
+    # leave _last_full_sync = None so full_sync retries on the next cycle.
+    if len(updated_sheet_df) < len(existing_ids):
+        print(
+            f"  full_sync WARN: sheet reverted during write "
+            f"(expected >={len(existing_ids)}, got {len(updated_sheet_df)}) "
+            f"— will retry next cycle",
+            flush=True,
+        )
+        return
+
+    _init_state_from_df(updated_sheet_df)
     _last_full_sync = datetime.now(timezone.utc)
     print(f"Full sync complete: {len(updated_sheet_df)} rows in '{ws.title}'.", flush=True)
 
@@ -397,13 +416,21 @@ def incremental_sync(ws) -> None:
             to_update.append((_row_index[tid], vals))
 
     if to_append:
-        ws.append_rows(to_append, value_input_option="USER_ENTERED")
+        resp = ws.append_rows(to_append, value_input_option="USER_ENTERED")
+        # Use the API response to get the actual row where appending landed,
+        # rather than trusting _next_data_row (which can be wrong after a revert).
+        try:
+            updated_range = resp["updates"]["updatedRange"]  # e.g. "Raw_Chad!A2740:K3239"
+            range_part = updated_range.split("!")[1].split(":")[0]  # "A2740"
+            first_row = int("".join(c for c in range_part if c.isdigit()))
+        except Exception:
+            first_row = _next_data_row  # fallback
         for i, vals in enumerate(to_append):
             tid = str(vals[_TID_IDX])
             if tid:
-                _row_index[tid] = _next_data_row + i
+                _row_index[tid] = first_row + i
                 _val_cache[tid] = _val_key(vals)
-        _next_data_row += len(to_append)
+        _next_data_row = first_row + len(to_append)
 
     if to_update:
         ws.batch_update(
