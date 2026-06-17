@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import gspread
-from gspread_dataframe import set_with_dataframe, get_as_dataframe
+from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 
 # ================== CONFIG ==================
@@ -307,16 +307,23 @@ def _init_state_from_df(final: pd.DataFrame) -> None:
 # ================== SYNC FUNCTIONS ==================
 
 def full_sync(ws) -> None:
-    """Full reconciliation: read sheet history, merge with DB window, rewrite sheet."""
+    """Full reconciliation: read sheet history, merge with DB window, rewrite sheet.
+
+    Uses ws.clear() + ws.update() (one direct range-write API call) instead of
+    set_with_dataframe / update_cells, which silently truncates large datasets.
+    """
     global _last_full_sync
     with sqlite3.connect(DB_PATH) as con:
         db_df = pull_trades_df(con, days=LOOKBACK_DAYS)
-    ensure_header(ws)
     final = history_preserving_merge(ws, db_df)
-    set_with_dataframe(
-        ws, final.fillna(""),
-        include_index=False, include_column_header=True, resize=True,
-    )
+
+    # Build 2-D value grid: header row + data rows
+    rows_out = [HEADER]
+    for _, row in final.iterrows():
+        rows_out.append(_row_vals(row.to_dict()))
+
+    ws.clear()
+    ws.update(values=rows_out, range_name="A1")
     try:
         ws.freeze(rows=1)
     except Exception:
