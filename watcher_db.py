@@ -322,6 +322,11 @@ def full_sync(ws) -> None:
     for _, row in final.iterrows():
         rows_out.append(_row_vals(row.to_dict()))
 
+    needed_rows = len(rows_out) + 500   # buffer for upcoming incremental appends
+    try:
+        ws.resize(rows=needed_rows, cols=len(HEADER))
+    except Exception:
+        pass
     ws.clear()
     ws.update(values=rows_out, range_name="A1")
     try:
@@ -354,6 +359,12 @@ def incremental_sync(ws) -> None:
             to_update.append((_row_index[tid], vals))
 
     if to_append:
+        needed_rows = _next_data_row + len(to_append) + 200
+        try:
+            if ws.row_count < needed_rows:
+                ws.resize(rows=needed_rows)
+        except Exception:
+            pass
         ws.append_rows(to_append, value_input_option="USER_ENTERED")
         for i, vals in enumerate(to_append):
             tid = str(vals[_TID_IDX])
