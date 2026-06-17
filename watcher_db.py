@@ -247,6 +247,10 @@ def history_preserving_merge(ws, db_df: pd.DataFrame) -> pd.DataFrame:
     sheet_dt = pd.to_datetime(sheet_df.get("DateTime", pd.Series(dtype="object")), errors="coerce")
     old_mask = sheet_dt.isna() | (sheet_dt < cutoff_naive)
     sheet_old = sheet_df[old_mask].copy()
+    # Drop no-TradeID rows from sheet_old — they are junk/phantom rows, not real history.
+    # All legitimate trades have auto-increment TradeIDs from the DB.
+    sheet_old_has_id = sheet_old["TradeID"].notna() & (sheet_old["TradeID"].astype(str).str.strip() != "")
+    sheet_old = sheet_old[sheet_old_has_id].copy()
 
     for c in HEADER:
         if c not in db_df.columns:
@@ -256,8 +260,7 @@ def history_preserving_merge(ws, db_df: pd.DataFrame) -> pd.DataFrame:
     combined = pd.concat([sheet_old, db_df], ignore_index=True)
     has_id = combined["TradeID"].notna() & (combined["TradeID"] != "")
     with_id = combined[has_id].drop_duplicates(subset=["TradeID"], keep="last")
-    no_id = combined[~has_id]
-    final = pd.concat([with_id, no_id], ignore_index=True)
+    final = with_id.copy()   # no_id rows discarded — all real trades have IDs
 
     final_dt = pd.to_datetime(final.get("DateTime", pd.Series(dtype="object")), errors="coerce")
     final = (
@@ -322,11 +325,9 @@ def full_sync(ws) -> None:
     for _, row in final.iterrows():
         data_rows.append(_row_vals(row.to_dict()))
 
-    # Pre-expand the grid so append_rows never hits the row ceiling.
-    # ws.resize() works; ws.clear() preserves the new size; append_rows then
-    # writes freely within the expanded grid.
-    needed_rows = len(data_rows) + 1 + 500   # header + data + buffer
-    ws.resize(rows=needed_rows, cols=len(HEADER))
+    # Write: clear → header → append data in chunks.
+    # append_rows (values.append) auto-extends the grid as long as there is room;
+    # we pre-clear so the sheet is empty and every append finds the next row cleanly.
     ws.clear()
     ws.update(values=[HEADER], range_name="A1")
     try:
@@ -334,10 +335,17 @@ def full_sync(ws) -> None:
     except Exception:
         pass
 
-    # Append data in chunks within the pre-expanded grid
     _CHUNK = 1000
     for i in range(0, len(data_rows), _CHUNK):
         ws.append_rows(data_rows[i : i + _CHUNK], value_input_option="USER_ENTERED")
+
+    # After writing, trim the grid to exact size + 500-row buffer so future
+    # batch_update calls to these row numbers never exceed grid limits, and
+    # Google Sheets doesn't auto-trim the grid back to a smaller value.
+    try:
+        ws.resize(rows=len(data_rows) + 1 + 500, cols=len(HEADER))
+    except Exception:
+        pass
 
     _init_state_from_df(final)
     _last_full_sync = datetime.now(timezone.utc)
