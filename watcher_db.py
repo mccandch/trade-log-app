@@ -247,10 +247,11 @@ def history_preserving_merge(ws, db_df: pd.DataFrame) -> pd.DataFrame:
     sheet_dt = pd.to_datetime(sheet_df.get("DateTime", pd.Series(dtype="object")), errors="coerce")
     old_mask = sheet_dt.isna() | (sheet_dt < cutoff_naive)
     sheet_old = sheet_df[old_mask].copy()
-    # Drop no-TradeID rows from sheet_old — they are junk/phantom rows, not real history.
+    # Drop no-TradeID rows — they are junk/phantom rows, not real history.
     # All legitimate trades have auto-increment TradeIDs from the DB.
-    sheet_old_has_id = sheet_old["TradeID"].notna() & (sheet_old["TradeID"].astype(str).str.strip() != "")
-    sheet_old = sheet_old[sheet_old_has_id].copy()
+    if "TradeID" in sheet_old.columns and not sheet_old.empty:
+        keep = sheet_old["TradeID"].notna() & (sheet_old["TradeID"].astype(str).str.strip() != "")
+        sheet_old = sheet_old[keep].copy()
 
     for c in HEADER:
         if c not in db_df.columns:
