@@ -313,13 +313,12 @@ def _init_state_from_df(final: pd.DataFrame) -> None:
 def full_sync(ws) -> None:
     """Full reconciliation: read sheet history, merge with DB window, rewrite sheet.
 
-    Write strategy: pre-resize → clear → header → append chunks → post-resize.
-    append_rows is bounded by the server-side grid rowCount. If the cached ws.row_count
-    is stale (e.g. still at the old value after a sheet reset), append silently truncates
-    at the old grid boundary. Pre-resizing refreshes both the server grid and the local
-    ws.row_count cache before any data is written, preventing that truncation.
-    Post-resize then locks the grid at data_count + 500 so future batch_update calls
-    never exceed grid limits.
+    Write strategy: resize → overwrite rows in place (no clear) → trim old tail.
+    ws.clear() triggers Google Sheets' automatic data-restore: if the sheet is open
+    in a browser and all content is deleted, Google restores the previous version
+    within ~6 seconds. To avoid this, we overwrite existing rows in place using
+    ws.update() with explicit ranges, then clear only the tail rows that exceed the
+    new data length.
     """
     global _last_full_sync
     with sqlite3.connect(DB_PATH) as con:
@@ -330,43 +329,38 @@ def full_sync(ws) -> None:
     for _, row in final.iterrows():
         data_rows.append(_row_vals(row.to_dict()))
 
-    needed = len(data_rows) + 1 + 500  # header + data + buffer
+    n_data = len(data_rows)
+    needed = n_data + 1 + 500  # header + data + buffer
+    all_values = [HEADER] + data_rows  # header at row 1, data at rows 2..n_data+1
 
-    print(f"  full_sync: {len(data_rows)} data rows, need grid>={needed}", flush=True)
-    print(f"  ws.row_count before pre-resize: {ws.row_count}", flush=True)
+    print(f"  full_sync: {n_data} data rows", flush=True)
 
     ws.resize(rows=needed, cols=len(HEADER))
-    print(f"  ws.row_count after pre-resize: {ws.row_count}", flush=True)
 
-    ws.clear()
-    # ws.clear() causes Google to auto-trim the server-side grid back to its
-    # previous rowCount (2739 here). Resize again immediately after clear so
-    # the grid is large enough before any data is written.
-    ws.resize(rows=needed, cols=len(HEADER))
-    print(f"  ws.row_count after clear+resize: {ws.row_count}", flush=True)
-
-    ws.update(values=[HEADER], range_name="A1")
     try:
         ws.freeze(rows=1)
     except Exception:
         pass
 
+    # Overwrite rows in place using explicit ranges — no clear().
+    # ws.clear() triggers Google Sheets' automatic version restore within ~6 seconds
+    # when the sheet is open in a browser, silently undoing all subsequent writes.
     _CHUNK = 1000
-    for i in range(0, len(data_rows), _CHUNK):
-        chunk = data_rows[i : i + _CHUNK]
-        ws.append_rows(chunk, value_input_option="USER_ENTERED")
-        print(f"  appended rows {i+1}-{i+len(chunk)}", flush=True)
+    for i in range(0, len(all_values), _CHUNK):
+        chunk = all_values[i : i + _CHUNK]
+        start_row = i + 1
+        end_row = start_row + len(chunk) - 1
+        ws.update(values=chunk, range_name=f"A{start_row}:{_COL_END}{end_row}",
+                  value_input_option="USER_ENTERED")
 
-    # Verify actual rows on the sheet (server read, not cached count)
-    try:
-        col_a = ws.col_values(1)
-        actual_data_rows = len(col_a) - 1
-        print(f"  verified {actual_data_rows} data rows in sheet after write", flush=True)
-    except Exception as e:
-        print(f"  WARNING could not verify row count: {e}", flush=True)
-
-    ws.resize(rows=needed, cols=len(HEADER))
-    print(f"  ws.row_count after final resize: {ws.row_count}", flush=True)
+    # Clear stale tail rows if data shrank since the last sync.
+    new_data_end = n_data + 1
+    if ws.row_count > new_data_end + 50:
+        tail_range = f"A{new_data_end + 1}:{_COL_END}{ws.row_count}"
+        try:
+            ws.batch_clear([tail_range])
+        except Exception:
+            pass
 
     _init_state_from_df(final)
     _last_full_sync = datetime.now(timezone.utc)
