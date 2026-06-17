@@ -313,9 +313,13 @@ def _init_state_from_df(final: pd.DataFrame) -> None:
 def full_sync(ws) -> None:
     """Full reconciliation: read sheet history, merge with DB window, rewrite sheet.
 
-    Write strategy: clear → write header via update → append data rows in chunks.
-    values.append auto-extends the sheet grid, so this avoids the silent truncation
-    that values.update causes when the data exceeds the sheet's current rowCount.
+    Write strategy: pre-resize → clear → header → append chunks → post-resize.
+    append_rows is bounded by the server-side grid rowCount. If the cached ws.row_count
+    is stale (e.g. still at the old value after a sheet reset), append silently truncates
+    at the old grid boundary. Pre-resizing refreshes both the server grid and the local
+    ws.row_count cache before any data is written, preventing that truncation.
+    Post-resize then locks the grid at data_count + 500 so future batch_update calls
+    never exceed grid limits.
     """
     global _last_full_sync
     with sqlite3.connect(DB_PATH) as con:
@@ -326,9 +330,17 @@ def full_sync(ws) -> None:
     for _, row in final.iterrows():
         data_rows.append(_row_vals(row.to_dict()))
 
-    # Write: clear → header → append data in chunks.
-    # append_rows (values.append) auto-extends the grid as long as there is room;
-    # we pre-clear so the sheet is empty and every append finds the next row cleanly.
+    needed = len(data_rows) + 1 + 500  # header + data + buffer
+
+    # Pre-resize: refresh server-side grid and local row_count cache BEFORE writing.
+    # append_rows does not auto-extend past the current grid rowCount; without this,
+    # a stale cached rowCount (e.g. 2739 from before a sheet reset) silently truncates
+    # the write at the old boundary.
+    try:
+        ws.resize(rows=needed, cols=len(HEADER))
+    except Exception:
+        pass
+
     ws.clear()
     ws.update(values=[HEADER], range_name="A1")
     try:
@@ -340,11 +352,9 @@ def full_sync(ws) -> None:
     for i in range(0, len(data_rows), _CHUNK):
         ws.append_rows(data_rows[i : i + _CHUNK], value_input_option="USER_ENTERED")
 
-    # After writing, trim the grid to exact size + 500-row buffer so future
-    # batch_update calls to these row numbers never exceed grid limits, and
-    # Google Sheets doesn't auto-trim the grid back to a smaller value.
+    # Post-write resize: re-lock the grid in case Google auto-trimmed it during the write.
     try:
-        ws.resize(rows=len(data_rows) + 1 + 500, cols=len(HEADER))
+        ws.resize(rows=needed, cols=len(HEADER))
     except Exception:
         pass
 
