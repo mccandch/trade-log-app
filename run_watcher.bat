@@ -27,6 +27,14 @@ rem Optional: check your creds/db paths inside watcher_db.py
 rem if not exist "C:\path\to\service_account.json" echo Missing service_account.json>>"%LOG%"
 rem if not exist "C:\path\to\data.db3" echo Missing data.db3>>"%LOG%"
 
+rem Check if watcher is already running
+wmic process where "CommandLine like '%%watcher_db%%' and name like '%%python%%'" get ProcessId /value 2>nul | find "ProcessId=" >nul
+if %errorlevel% == 0 (
+    echo [%DATE% %TIME%] Watcher already running — skipping start. >> "%LOG%"
+    echo Watcher is already running. Not starting another instance.
+    exit /b 0
+)
+
 echo [%DATE% %TIME%] Starting watcher >> "%LOG%"
 cd /d "%BASE%"
 "%PY%" -u "%SCRIPT%" >> "%LOG%" 2>&1

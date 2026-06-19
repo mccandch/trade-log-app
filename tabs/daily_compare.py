@@ -835,6 +835,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go["onFirstDataRendered"] = autoSizeJs
     go["onGridSizeChanged"]  = autoSizeJs
 
+    _dr = st.session_state.get("dc_date_range", ("", ""))
     grid = AgGrid(
         stats_for_grid,
         gridOptions=go,
@@ -842,7 +843,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=False,
-        key=f"dc_grid_{user}",
+        key=f"dc_grid_{user}_{_dr[0]}_{_dr[1]}",
     )
 
     def _extract_selected_rows(g):
