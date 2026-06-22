@@ -135,8 +135,14 @@ def ensure_header(ws) -> None:
 # ================== DB PULL ==================
 
 def pick_short_leg(
-    cur: sqlite3.Cursor, order_id: Optional[int]
+    cur: sqlite3.Cursor, order_id: Optional[int], hint_right: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[float]]:
+    """Return (right, strike) of the short leg for this order.
+
+    hint_right: if 'C' or 'P', restrict search to legs of that type first.
+    This matters for iron condors where both spread trades share one OrderIDOpen
+    but one is a call spread and the other is a put spread.
+    """
     if not order_id:
         return (None, None)
     rows = cur.execute(
@@ -144,11 +150,16 @@ def pick_short_leg(
     ).fetchall()
     if not rows:
         return (None, None)
-    short = [r for r in rows if r[2] is not None and float(r[2]) < 0]
+    # Restrict to matching legs when we have a type hint; fall back to all legs.
+    if hint_right in ("C", "P"):
+        candidates = [r for r in rows if normalize_right(r[0]) == hint_right] or rows
+    else:
+        candidates = rows
+    short = [r for r in candidates if r[2] is not None and float(r[2]) < 0]
     pick = (
         sorted(short, key=lambda r: abs(float(r[2])), reverse=True)[0]
         if short
-        else rows[0]
+        else candidates[0]
     )
     right = normalize_right(pick[0])
     try:
@@ -169,7 +180,8 @@ def pull_trades_df(con: sqlite3.Connection, days: int = LOOKBACK_DAYS) -> pd.Dat
     rows = cur.execute(
         """
         SELECT TradeID, Account, Strategy, DateOpened,
-               TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day
+               TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day,
+               ShortCall, ShortPut
         FROM Trade
         WHERE DateOpened >= ?
            OR (Year IS NOT NULL AND Year * 10000 + Month * 100 + Day >= ?)
@@ -180,7 +192,7 @@ def pull_trades_df(con: sqlite3.Connection, days: int = LOOKBACK_DAYS) -> pd.Dat
 
     src = os.path.basename(DB_PATH)
     items = []
-    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day in rows:
+    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day, ShortCall, ShortPut in rows:
         if not accounts_ok(Account):
             continue
         dt = ticks_to_dt_utc(DateOpened)
@@ -189,7 +201,16 @@ def pull_trades_df(con: sqlite3.Connection, days: int = LOOKBACK_DAYS) -> pd.Dat
                 dt = datetime(int(Year), int(Month), int(Day), 9, 30, 0, tzinfo=timezone.utc)
             except Exception:
                 pass
-        right, strike = pick_short_leg(cur, OrderIDOpen)
+
+        # Use ShortCall / ShortPut directly — these are always correct per trade,
+        # even when two trades (call spread + put spread) share the same OrderIDOpen.
+        if ShortCall is not None:
+            right, strike = "C", float(ShortCall)
+        elif ShortPut is not None:
+            right, strike = "P", float(ShortPut)
+        else:
+            right, strike = pick_short_leg(cur, OrderIDOpen)
+
         batch_id = f"db-{USER_NAME}-{dt.date().isoformat()}" if dt else None
         items.append({
             "User":     USER_NAME,
