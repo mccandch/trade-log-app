@@ -1,5 +1,7 @@
 # Streamlit Trade Stats MVP
 
+Docs: [docs/trade_log_analyzer.md](docs/trade_log_analyzer.md) — how the Trade Log Analyzer tab works (CSV format, PCR definition, rule tester, Google Sheets export).
+
 ## What you get
 - `watcher.py`: runs on each PC, uploads your daily log to Google Sheets and **replaces** that day's rows when the file changes.
 - `app.py`: Streamlit dashboard that reads the sheet and shows your daily % metrics (overall + by strategy) with date filtering.

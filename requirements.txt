@@ -9,3 +9,5 @@ watchdog==4.0.1
 pyotp==2.9.0
 pyyaml>=6.0
 streamlit-aggrid==0.3.4.post3
+plotly>=5.0
+openpyxl>=3.1
