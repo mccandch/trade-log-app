@@ -20,7 +20,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import AuthorizedSession, Request
+from google.oauth2.credentials import Credentials as UserCredentials
 from gspread_dataframe import set_with_dataframe
 
 # ---------------------------------------------------------------------------
@@ -67,11 +68,33 @@ TRADE_COUNT_BUCKETS = [
     (26, 30), (31, 40), (41, 50), (51, 75), (76, np.inf),
 ]
 
+ROLLING_WINDOWS_MONTHS = [1, 2, 3, 4, 6, 8, 9, 12]
+ROLLING_WINDOW_LABELS = [f"{m} Mo" for m in ROLLING_WINDOWS_MONTHS]
+
+# The rolling-stat metrics, each with how its values are formatted.
+ROLLING_HISTORY_METRICS = [
+    ("PCR %", "pct"),
+    ("Win Rate %", "pct"),
+    ("Total P/L", "money"),
+    ("Max Drawdown $", "money"),
+    ("Max Drawdown %", "pct"),
+    ("MAR", "num"),
+    ("CAGR %", "pct"),
+    ("Profit Factor", "num"),
+    ("Trades", "int"),
+]
+
 # Chart colors (validated reference palette; chart chrome comes from the
 # Streamlit plotly theme so light/dark mode both work).
 POS_COLOR = "#2a78d6"   # diverging cool pole -> gains
 NEG_COLOR = "#e34948"   # diverging warm pole -> losses
 LINE_COLOR = "#2a78d6"  # single-series lines/bars
+
+# Fixed categorical slot order (validated set); each rolling window always
+# keeps the same color even when only some windows are charted.
+CATEGORICAL_COLORS = ["#2a78d6", "#1baf7a", "#eda100", "#008300",
+                      "#4a3aa7", "#e34948", "#e87ba4", "#eb6834"]
+ROLLING_WINDOW_COLORS = dict(zip(ROLLING_WINDOW_LABELS, CATEGORICAL_COLORS))
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +594,108 @@ def calculate_yearly_summary(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
 
 
+def _window_stat_values(g: pd.DataFrame, starting_capital: float, days: int) -> dict:
+    """Stat set for one rolling window's trades, annualized over `days`."""
+    pl = g["P/L"]
+    wins, losses = g[pl > 0], g[pl < 0]
+    _, max_dd, max_dd_pct = calculate_drawdown(g, starting_capital)
+    cagr = np.nan
+    end_equity = starting_capital + pl.sum()
+    if starting_capital > 0 and end_equity > 0 and days > 0:
+        cagr = 100 * ((end_equity / starting_capital) ** (365.0 / days) - 1)
+    return {
+        "Total P/L": pl.sum(),
+        "Win Rate %": _safe_div(100 * len(wins), len(g)),
+        "PCR %": _pcr(g),
+        "Avg P/L": pl.mean(),
+        "Profit Factor": _safe_div(wins["P/L"].sum(), abs(losses["P/L"].sum())),
+        "Max Drawdown $": max_dd,
+        "Max Drawdown %": max_dd_pct,
+        "CAGR %": cagr,
+        "MAR": _safe_div(cagr, abs(max_dd_pct)) if pd.notna(max_dd_pct) else np.nan,
+    }
+
+
+def calculate_rolling_stats(df: pd.DataFrame, starting_capital: float,
+                            end: pd.Timestamp | None = None,
+                            data_start: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Trailing-window stats for each ROLLING_WINDOWS_MONTHS window.
+
+    Windows are anchored to `end` (default: the last close/open time in the
+    data) and include trades *opened* within the window. CAGR annualizes over
+    the part of the window actually covered by the log, so a 12-month window
+    on a 6-month log isn't diluted by empty months.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    if end is None:
+        end = (df["Close DateTime"].max() if df["Close DateTime"].notna().any()
+               else df["Open DateTime"].max())
+    if data_start is None:
+        data_start = df["Open DateTime"].min()
+
+    rows = []
+    for months, label in zip(ROLLING_WINDOWS_MONTHS, ROLLING_WINDOW_LABELS):
+        start = end - pd.DateOffset(months=months)
+        span_start = max(start, data_start)
+        days = max((end - span_start).days, 1)
+        g = df[df["Open DateTime"] > start]
+        row = {"Window": label, "From": span_start.date(), "Trades": len(g)}
+        if len(g):
+            row.update(_window_stat_values(g, starting_capital, days))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def rolling_anchor_dates(data_start: pd.Timestamp, data_end: pd.Timestamp) -> list:
+    """Month-start anchor dates covering the log, oldest to newest.
+
+    Each anchor 'sees' only trades opened before it, so the newest anchor
+    (the month start after the last trade) reflects the full latest data.
+    """
+    first = (data_start.to_period("M") + 1).to_timestamp()
+    last = (data_end.to_period("M") + 1).to_timestamp()
+    return list(pd.date_range(first, last, freq="MS"))
+
+
+def calculate_rolling_history(df: pd.DataFrame, starting_capital: float,
+                              anchors: list, data_start: pd.Timestamp,
+                              data_end: pd.Timestamp) -> pd.DataFrame:
+    """Rolling stats recomputed at every anchor date (long form).
+
+    For each anchor A and window of N months, includes trades opened in
+    (A - N months, A). Returns one row per (Anchor, Window) with the
+    _window_stat_values metrics; windows with no trades keep NaN stats.
+    Pass the full log's anchors/data_start/data_end when computing a single
+    strategy so all scopes share the same calendar grid.
+    """
+    rows = []
+    for anchor in anchors:
+        for months, label in zip(ROLLING_WINDOWS_MONTHS, ROLLING_WINDOW_LABELS):
+            w_start = anchor - pd.DateOffset(months=months)
+            g = df[(df["Open DateTime"] > w_start) & (df["Open DateTime"] < anchor)]
+            span_start = max(w_start, data_start)
+            span_end = min(anchor, data_end)
+            days = max((span_end - span_start).days, 1)
+            row = {"Anchor": anchor, "Window": label, "Trades": len(g)}
+            if len(g):
+                row.update(_window_stat_values(g, starting_capital, days))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def rolling_history_table(hist: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Pivot the long-form history into windows-as-rows, anchors-as-columns
+    (newest first), matching the spreadsheet-style trend layout."""
+    if hist.empty or metric not in hist.columns:
+        return pd.DataFrame()
+    t = hist.pivot(index="Window", columns="Anchor", values=metric)
+    t = t.reindex(ROLLING_WINDOW_LABELS)
+    t = t[sorted(t.columns, reverse=True)]
+    t.columns = [f"{a.month}/{a.day}/{a.year % 100:02d}" for a in t.columns]
+    return t.rename_axis(None, axis=1).reset_index()
+
+
 def calculate_concurrent_exposure(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """Running concurrent margin / open-trade count from open+close events."""
     need = df[df["Open DateTime"].notna() & df["Close DateTime"].notna()].copy()
@@ -715,6 +840,86 @@ def comparison_stats(df: pd.DataFrame, starting_capital: float) -> dict:
 # Google Sheets export
 # ---------------------------------------------------------------------------
 
+# Least-privilege scope: drive.file only touches files this app creates
+# (enough to create, populate and share the report), not the whole Drive.
+# The Sheets API accepts drive.file for app-created files, so no separate
+# spreadsheets scope is needed.
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+
+def report_export_enabled() -> bool:
+    """Whether this deployment may create Google Sheets reports.
+
+    Requires BOTH an explicit enable flag AND stored OAuth user credentials.
+    The report is created as — and lands in the Drive of — whoever minted
+    those credentials (see docs/google_sheets_oauth_setup.md). Keep both out
+    of any public/shared deployment's secrets so the button never appears
+    there and no other visitor can write to that Drive.
+    """
+    try:
+        return bool(st.secrets.get("enable_sheets_export", False)) and "gcp_oauth" in st.secrets
+    except Exception:
+        return False
+
+
+REPORT_FOLDER_NAME = "Trade Log Reports"
+_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+
+
+def _oauth_credentials() -> UserCredentials:
+    """Build & refresh OAuth user credentials for the report owner.
+
+    Unlike a service account (which has zero Drive storage and fails with a
+    quota error on the first create), an OAuth user creates files in their own
+    Drive, counted against their own quota.
+    """
+    oauth = st.secrets["gcp_oauth"]
+    creds = UserCredentials(
+        None,  # no access token yet; refreshed below
+        refresh_token=oauth["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=oauth["client_id"],
+        client_secret=oauth["client_secret"],
+        scopes=SHEETS_SCOPES,
+    )
+    creds.refresh(Request())
+    return creds
+
+
+def _get_or_create_report_folder(creds: UserCredentials) -> str | None:
+    """Return the Drive folder id for REPORT_FOLDER_NAME, creating it if needed.
+
+    With the drive.file scope this only sees folders the app itself created, so
+    it reuses its own folder across runs (a same-named folder you made by hand
+    is invisible to the app and left untouched). Returns None on any Drive error
+    so the report still lands in Drive root rather than failing outright.
+    """
+    try:
+        session = AuthorizedSession(creds)
+        q = (
+            f"name = '{REPORT_FOLDER_NAME}' "
+            "and mimeType = 'application/vnd.google-apps.folder' "
+            "and trashed = false"
+        )
+        resp = session.get(
+            _DRIVE_FILES_URL,
+            params={"q": q, "fields": "files(id,name)", "spaces": "drive"},
+        )
+        resp.raise_for_status()
+        files = resp.json().get("files", [])
+        if files:
+            return files[0]["id"]
+        resp = session.post(
+            _DRIVE_FILES_URL,
+            json={"name": REPORT_FOLDER_NAME,
+                  "mimeType": "application/vnd.google-apps.folder"},
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+    except Exception:
+        return None
+
+
 def _sheets_safe(table: pd.DataFrame) -> pd.DataFrame:
     """Convert datetimes/dates/objects to Sheets-serializable values."""
     t = table.copy()
@@ -731,27 +936,29 @@ def _sheets_safe(table: pd.DataFrame) -> pd.DataFrame:
 
 def build_google_sheets_report(raw_df: pd.DataFrame | None,
                                summary_tables: dict[str, pd.DataFrame],
-                               share_email: str) -> str:
+                               share_email: str,
+                               report_name: str | None = None) -> str:
     """Create a new Google Sheets spreadsheet with one worksheet per summary
     table (plus optionally the raw filtered trades), share it with the given
     email, and return its URL.
 
-    Uses the same service-account credentials as the rest of the app
-    (st.secrets["gcp_service_account"]).
+    The file is named `report_name` (falling back to a timestamp) and placed in
+    the REPORT_FOLDER_NAME folder in the owner's Drive. Authenticates as the
+    OAuth report owner (st.secrets["gcp_oauth"]). See report_export_enabled().
     """
-    sa_info = dict(st.secrets["gcp_service_account"])
-    creds = Credentials.from_service_account_info(
-        sa_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
+    creds = _oauth_credentials()
     gc = gspread.authorize(creds)
+    folder_id = _get_or_create_report_folder(creds)
 
-    sh = gc.create(f"Trade Log Report {datetime.now():%Y-%m-%d %H.%M}")
+    title = report_name or f"Trade Log Report {datetime.now():%Y-%m-%d %H.%M}"
+    sh = gc.create(title, folder_id=folder_id) if folder_id else gc.create(title)
     if share_email:
-        sh.share(share_email, perm_type="user", role="writer", notify=False)
+        # The owner already has access; sharing a file with its own owner
+        # errors, so don't let that abort the whole report.
+        try:
+            sh.share(share_email, perm_type="user", role="writer", notify=False)
+        except gspread.exceptions.APIError:
+            pass
 
     tables: dict[str, pd.DataFrame] = {}
     if raw_df is not None and len(raw_df):
@@ -802,7 +1009,7 @@ def _show_df(df: pd.DataFrame, height: int | None = None):
             continue
         if c.endswith("%") or "Rate" in c or c in ("Drawdown %",):
             fmt_map[c] = lambda v: fmt_pct(v) if pd.notna(v) else "—"
-        elif c in ("Profit Factor", "Avg Hold (min)", "Avg Trades/Day"):
+        elif c in ("Profit Factor", "Avg Hold (min)", "Avg Trades/Day", "MAR"):
             fmt_map[c] = lambda v: fmt_num(v, 2) if pd.notna(v) else "—"
         elif c in ("Trades", "Wins", "Losses", "Days", "Stop Losses",
                    "Expirations", "Max Trades/Day", "Year", "Concurrent Trades"):
@@ -851,6 +1058,52 @@ def _line_chart(x, y, title, x_title, y_title, fill=False, color=LINE_COLOR):
 
 def _plot(fig):
     st.plotly_chart(fig, use_container_width=True)
+
+
+_ROLLING_FMTS = {
+    "money": _money_fmt,
+    "pct": lambda v: fmt_pct(v) if pd.notna(v) else "—",
+    "num": lambda v: fmt_num(v, 2) if pd.notna(v) else "—",
+    "int": lambda v: f"{int(v):,}" if pd.notna(v) else "—",
+}
+_ROLLING_HOVERS = {
+    "money": "$%{y:,.0f}", "pct": "%{y:.1f}%", "num": "%{y:.2f}", "int": "%{y:,.0f}",
+}
+
+
+def _rolling_history_chart(hist: pd.DataFrame, metric: str, kind: str,
+                           windows: list[str]):
+    """One line per selected rolling window across the anchor dates."""
+    hover = _ROLLING_HOVERS[kind]
+    fig = go.Figure()
+    for label in ROLLING_WINDOW_LABELS:  # fixed order = fixed colors
+        if label not in windows:
+            continue
+        d = hist[hist["Window"] == label].sort_values("Anchor")
+        fig.add_trace(go.Scatter(
+            x=list(d["Anchor"]), y=list(d[metric]), mode="lines+markers",
+            name=label, connectgaps=False,
+            line=dict(color=ROLLING_WINDOW_COLORS[label], width=2),
+            marker=dict(size=8),
+            hovertemplate="%{x|%b %Y}<br>" + label + ": " + hover + "<extra></extra>",
+        ))
+    fig.update_layout(title=f"Rolling {metric} Over Time", xaxis_title="As-of date",
+                      yaxis_title=metric, legend_title_text="Window")
+    return fig
+
+
+def _show_rolling_table(table: pd.DataFrame, kind: str):
+    """Render a windows-x-anchors table with the metric's own formatting."""
+    if table.empty:
+        st.info("No data for this metric with the current scope.")
+        return
+    fmt = _ROLLING_FMTS[kind]
+    date_cols = [c for c in table.columns if c != "Window"]
+    try:
+        st.dataframe(table.style.format({c: fmt for c in date_cols}),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1293,47 @@ def render_trade_log_analyzer_tab():
                           yaxis_title="Number of Days", showlegend=False)
         _plot(fig)
 
+    # ---- Rolling Stats Over Time -----------------------------------------
+    roll_end = (fdf["Close DateTime"].max() if fdf["Close DateTime"].notna().any()
+                else fdf["Open DateTime"].max())
+    roll_data_start = fdf["Open DateTime"].min()
+    roll_anchors = rolling_anchor_dates(roll_data_start, roll_end)
+    roll_all = calculate_rolling_stats(fdf, starting_capital, roll_end, roll_data_start)
+    hist_all = calculate_rolling_history(fdf, starting_capital, roll_anchors,
+                                         roll_data_start, roll_end)
+
+    st.markdown("#### Rolling Stats Over Time")
+    st.caption("Each column is an as-of date (newest first); each row is the "
+               "trailing 1-12 month window ending on that date, so reading "
+               "across a row shows whether a stat is improving or declining. "
+               "Drawdown, CAGR and MAR use the starting capital set above.")
+    rc1, rc2 = st.columns(2)
+    roll_scope = rc1.selectbox(
+        "Scope", ["All Strategies (combined)"] + sorted(fdf["Strategy"].dropna().unique()),
+        key=KEY + "roll_scope",
+    )
+    roll_chart_windows = rc2.multiselect(
+        "Windows to chart", ROLLING_WINDOW_LABELS,
+        default=["1 Mo", "3 Mo", "6 Mo", "12 Mo"], key=KEY + "roll_windows",
+    )
+    if roll_scope == "All Strategies (combined)":
+        hist = hist_all
+    else:
+        hist = calculate_rolling_history(
+            fdf[fdf["Strategy"] == roll_scope], starting_capital, roll_anchors,
+            roll_data_start, roll_end,
+        )
+
+    for roll_metric, roll_kind in ROLLING_HISTORY_METRICS:
+        with st.expander(f"Rolling {roll_metric}"):
+            if roll_metric not in hist.columns:
+                st.info("No trades in scope for this metric.")
+                continue
+            if roll_chart_windows:
+                _plot(_rolling_history_chart(hist, roll_metric, roll_kind,
+                                             roll_chart_windows))
+            _show_rolling_table(rolling_history_table(hist, roll_metric), roll_kind)
+
     # ---- Daily Analysis --------------------------------------------------
     with st.expander("Daily Analysis"):
         win_days = (daily["Day Result"] == "Win").sum()
@@ -1211,34 +1505,41 @@ def render_trade_log_analyzer_tab():
         )
 
         st.markdown("**Google Sheets report**")
-        g1, g2 = st.columns([2, 1])
-        share_email = g1.text_input(
-            "Share report with (email)", value="chad.mccandless@gmail.com",
-            key=KEY + "gs_email",
-        )
-        include_raw = g2.checkbox("Include raw trades sheet", value=True,
-                                  key=KEY + "gs_raw")
-        if st.button("Create Google Sheets report", key=KEY + "gs_build"):
-            try:
-                with st.spinner("Creating Google Sheets report (this can take a minute)..."):
-                    url = build_google_sheets_report(
-                        fdf if include_raw else None,
-                        {
-                            "Summary Metrics": summary_metrics_df,
-                            "Daily Summary": daily,
-                            "Strategy Summary": strat,
-                            "Volga Summary": volga,
-                            "Side Summary": side,
-                            "Time Bucket Summary": tb,
-                            "Trade Count Buckets": tc_buckets,
-                            "Monthly Summary": monthly,
-                            "Yearly Summary": yearly,
-                            "Outliers": outliers,
-                        },
-                        share_email.strip(),
-                    )
-                st.session_state[KEY + "gs_url"] = url
-            except Exception as exc:
-                st.error(f"Could not create the Google Sheets report: {exc}")
-        if st.session_state.get(KEY + "gs_url"):
-            st.success(f"Report created: {st.session_state[KEY + 'gs_url']}")
+        if not report_export_enabled():
+            st.caption("Google Sheets export is disabled on this deployment. "
+                       "Use the CSV downloads above.")
+        else:
+            g1, g2 = st.columns([2, 1])
+            share_email = g1.text_input(
+                "Share report with (email)", value="chad.mccandless@gmail.com",
+                key=KEY + "gs_email",
+            )
+            include_raw = g2.checkbox("Include raw trades sheet", value=True,
+                                      key=KEY + "gs_raw")
+            if st.button("Create Google Sheets report", key=KEY + "gs_build"):
+                try:
+                    with st.spinner("Creating Google Sheets report (this can take a minute)..."):
+                        url = build_google_sheets_report(
+                            fdf if include_raw else None,
+                            {
+                                "Summary Metrics": summary_metrics_df,
+                                "Rolling Stats (All Strategies)": roll_all,
+                                "Rolling History (All Strategies)": hist_all,
+                                "Daily Summary": daily,
+                                "Strategy Summary": strat,
+                                "Volga Summary": volga,
+                                "Side Summary": side,
+                                "Time Bucket Summary": tb,
+                                "Trade Count Buckets": tc_buckets,
+                                "Monthly Summary": monthly,
+                                "Yearly Summary": yearly,
+                                "Outliers": outliers,
+                            },
+                            share_email.strip(),
+                            report_name=uploaded.name.rsplit(".", 1)[0].strip() or None,
+                        )
+                    st.session_state[KEY + "gs_url"] = url
+                except Exception as exc:
+                    st.error(f"Could not create the Google Sheets report: {exc}")
+            if st.session_state.get(KEY + "gs_url"):
+                st.success(f"Report created: {st.session_state[KEY + 'gs_url']}")
