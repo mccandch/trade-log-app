@@ -187,19 +187,35 @@ def lvb_persist_upload_bytes(file_obj, state_key: str):
         bytes | None
     """
 
+    id_key = f"{state_key}_id"
+
     # Treat "no file" as no bytes
     if file_obj is None:
         st.session_state.pop(state_key, None)
+        st.session_state.pop(id_key, None)
         return None
 
     # Streamlit sometimes provides a DeletedFile sentinel when the user clears/replaces the upload.
     if type(file_obj).__name__ == "DeletedFile":
         st.session_state.pop(state_key, None)
+        st.session_state.pop(id_key, None)
         return None
 
-    # If we already have bytes cached, return them
+    # Identify this specific upload so that REPLACING the file (new upload) busts
+    # the cache. Streamlit gives each upload a unique file_id; fall back to
+    # (name, size) when it isn't available. Without this, the first file uploaded
+    # in a session was cached forever and later re-uploads were silently ignored.
+    file_id = getattr(file_obj, "file_id", None) or getattr(file_obj, "id", None)
+    if file_id is None:
+        file_id = (getattr(file_obj, "name", None), getattr(file_obj, "size", None))
+
+    # Reuse cached bytes only when they belong to the same upload.
     cached = st.session_state.get(state_key)
-    if isinstance(cached, (bytes, bytearray)) and len(cached) > 0:
+    if (
+        isinstance(cached, (bytes, bytearray))
+        and len(cached) > 0
+        and st.session_state.get(id_key) == file_id
+    ):
         return cached
 
     # Only read from real UploadedFile objects
@@ -212,9 +228,11 @@ def lvb_persist_upload_bytes(file_obj, state_key: str):
         except Exception:
             # Not readable (or was deleted mid-run)
             st.session_state.pop(state_key, None)
+            st.session_state.pop(id_key, None)
             return None
 
     st.session_state[state_key] = data
+    st.session_state[id_key] = file_id
     return data
 
 def lvb_df_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -250,11 +268,45 @@ def lvb_robust_side_from_text(s: str) -> Optional[str]:
     return None
 
 
+def lvb_volga_live_category(strategy, template, side) -> Optional[str]:
+    """Split a coarse live VOLGA-family trade into the fine-grained backtest category.
+
+    Live logs tag every VOLGA-strategy trade with a single coarse ``Strategy``
+    ("NON VOLGA DAYS" / "VOLGA DAYS"); the real breakdown lives in the ``Template``
+    (e.g. "Megatrend Puts NON VOLGA", "EMA-T Calls - NON VOLGA") and the trade
+    ``Side``. Backtest logs instead carry the split directly in ``Strategy``
+    ("Non VOLGA Days: Calls", "VOLGA: Puts", "VOLGA Mega Puts", ...). This maps a
+    live row onto the matching backtest label so the two line up.
+
+    Returns the canonical category, or None when the row isn't a VOLGA-family
+    trade (leave its normal StrategyMapped untouched).
+    """
+    strat = "" if strategy is None else str(strategy)
+    tmpl = "" if template is None else str(template)
+    text = f"{strat} {tmpl}"
+    if "VOLGA" not in text.upper():
+        return None
+    if side not in ("Call", "Put"):
+        return None
+
+    side_word = "Calls" if side == "Call" else "Puts"
+
+    # "Mega"/"Megatrend" trades are always the VOLGA Mega bucket, regardless of
+    # whether the day itself is a VOLGA or non-VOLGA day.
+    if re.search(r"mega", tmpl, re.I):
+        return f"VOLGA Mega {side_word}"
+
+    # Day type: "NON VOLGA" -> non-VOLGA day; anything else VOLGA-tagged -> VOLGA day.
+    if re.search(r"non\s*volga", text, re.I):
+        return f"Non VOLGA Days: {side_word}"
+    return f"VOLGA: {side_word}"
+
+
 def lvb_normalize_live(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
     df = df[df.get("Strategy","") != "Megatrend"].copy()
     df["StrategyMapped"] = df["Strategy"].apply(lambda x: lvb_map_strategy_name("live", x)[0])
-    df["PremiumSold"] = pd.to_numeric(df.get("TotalPremium", 0), errors="coerce").abs().fillna(0).round(2)
+    df["PremiumSold"] = _num_col(df, "TotalPremium", 0.0).abs().round(2)
     df["PnL"] = _num_col(df, "ProfitLoss", 0.0)
     df["PnL_rounded"] = df["PnL"].round(2)
     df["PnL_stats"] = df["PnL_rounded"]
@@ -262,6 +314,16 @@ def lvb_normalize_live(raw: pd.DataFrame) -> pd.DataFrame:
         df["Side"] = df["TradeType"].apply(lvb_live_side_from_tradetype)
     else:
         df["Side"] = None
+
+    # VOLGA family: override the coarse live label with the fine-grained category
+    # (Non VOLGA Days: Calls/Puts, VOLGA: Calls/Puts, VOLGA Mega Calls/Puts) so the
+    # live side lines up with how the backtest already splits these strategies.
+    if not df.empty:
+        _volga = df.apply(
+            lambda r: lvb_volga_live_category(r.get("Strategy"), r.get("Template"), r.get("Side")),
+            axis=1,
+        )
+        df["StrategyMapped"] = _volga.where(_volga.notna(), df["StrategyMapped"])
     # "Date" + optional "TimeOpened"
     if "TimeOpened" in df.columns:
         df["OpenDT"] = pd.to_datetime(df["Date"].astype(str) + " " + df["TimeOpened"].astype(str), errors="coerce")
@@ -662,6 +724,10 @@ def main():
 
         if (live_file is None) or (back_file is None):
             st.info("Upload both CSVs to begin.")
+            if live_file is None:
+                st.caption("🔴 Live file: not uploaded")
+            if back_file is None:
+                st.caption("🔴 Backtest file: not uploaded")
             return
 
         live_raw = lvb_read_csv_file(live_file)
@@ -678,7 +744,26 @@ def main():
         live_sel_full = live_norm[_within_window(live_norm["OpenDT"], start_date, end_date)].copy()
         back_sel_full = back_norm[_within_window(back_norm["OpenDT"], start_date, end_date)].copy()
 
+        # DEBUG: show what data was loaded + filtered
+        if live_norm.empty or back_norm.empty:
+            st.warning("⚠️ One or both CSVs loaded with zero rows")
+        with st.expander("📊 Debug info"):
+            st.write(f"**Live file**: {len(live_norm)} total rows → {len(live_sel_full)} in window [{start_date}, {end_date}]")
+            if not live_norm.empty:
+                st.write(f"  Date range: {live_norm['OpenDT'].min()} to {live_norm['OpenDT'].max()}")
+            st.write(f"**Backtest file**: {len(back_norm)} total rows → {len(back_sel_full)} in window [{start_date}, {end_date}]")
+            if not back_norm.empty:
+                st.write(f"  Date range: {back_norm['OpenDT'].min()} to {back_norm['OpenDT'].max()}")
+
         all_strats = sorted(set(live_sel_full["StrategyMapped"]).union(back_sel_full["StrategyMapped"]))
+
+        # Reset multiselect when strategies available change (e.g. different files uploaded).
+        # Explicitly set to default instead of just popping, so Streamlit's default parameter works reliably.
+        strats_sig = tuple(all_strats)
+        if st.session_state.get("_lvb_strats_sig") != strats_sig:
+            st.session_state["strat_picker"] = list(all_strats)
+            st.session_state["_lvb_strats_sig"] = strats_sig
+
         selected_strats = st.multiselect("Filter strategies", all_strats, default=all_strats, key="strat_picker")
 
         def _keep(df: pd.DataFrame) -> pd.DataFrame:
