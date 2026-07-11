@@ -12,7 +12,6 @@ import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 import gspread
-from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 import altair as alt
 from dateutil.relativedelta import relativedelta
@@ -217,10 +216,49 @@ def open_sheet():
     return gc.open(st.secrets["sheets"]["sheet_name"])
 
 
+# Cache of the last successfully loaded frame, used as a fallback when Sheets
+# rate-limits us (see load_sheets_data) so a transient 429 shows a warning
+# instead of crashing the whole app.
+_LAST_GOOD_SHEETS_DATA: Optional[pd.DataFrame] = None
+
+_SHEETS_DATA_COLUMNS = [
+    "User", "Date", "DateTime", "Strategy", "Template", "Right", "Strike",
+    "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
+    "__source_tab",
+]
+
+
+def _quote_worksheet_title(title: str) -> str:
+    return "'" + title.replace("'", "''") + "'"
+
+
+def _values_to_df(values: list) -> pd.DataFrame:
+    """Turn one batchGet valueRange's ragged rows into a DataFrame (row 0 = header)."""
+    if not values:
+        return pd.DataFrame()
+    header = [str(h).strip() for h in values[0]]
+    ncols = len(header)
+    rows = []
+    for row in values[1:]:
+        row = list(row)
+        if len(row) < ncols:
+            row = row + [""] * (ncols - len(row))
+        else:
+            row = row[:ncols]
+        rows.append(row)
+    return pd.DataFrame(rows, columns=header).replace("", pd.NA)
+
+
 @st.cache_data(ttl=120)
 def load_sheets_data() -> pd.DataFrame:
-    """Read Raw_* tabs and normalize columns for the app, with per-row User fallback to tab name."""
+    """Read Raw_* tabs and normalize columns for the app, with per-row User fallback to tab name.
 
+    All Raw_* tabs are fetched in a single values_batch_get call (one Sheets API
+    read no matter how many tabs exist) — reading each tab separately used to
+    burn through Google's per-minute read quota and take the whole app down
+    with a 429. If the Sheets API still errors (rate limit or otherwise), fall
+    back to the last successfully loaded data instead of raising.
+    """
     sh = open_sheet()
 
     def _rename_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -236,17 +274,23 @@ def load_sheets_data() -> pd.DataFrame:
         return df.rename(columns=rename_map) if rename_map else df
 
     def _read_all_raw_tabs() -> list[pd.DataFrame]:
-        frames: list[pd.DataFrame] = []
-        for ws in sh.worksheets():
-            title = ws.title or ""
-            if not title.startswith("Raw_"):
-                continue
+        titles = [ws.title or "" for ws in sh.worksheets()]
+        raw_titles = [t for t in titles if t.startswith("Raw_")]
+        if not raw_titles:
+            return []
 
-            try:
-                df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how="all")
-            except Exception as e:
-                st.warning(f"Could not read tab '{title}': {e}")
-                continue
+        resp = sh.values_batch_get(
+            [_quote_worksheet_title(t) for t in raw_titles],
+            params={
+                "valueRenderOption": "UNFORMATTED_VALUE",
+                "dateTimeRenderOption": "FORMATTED_STRING",
+            },
+        )
+        value_ranges = resp.get("valueRanges", [])
+
+        frames: list[pd.DataFrame] = []
+        for title, value_range in zip(raw_titles, value_ranges):
+            df = _values_to_df(value_range.get("values", [])).dropna(how="all")
             if df.empty:
                 continue
 
@@ -329,18 +373,22 @@ def load_sheets_data() -> pd.DataFrame:
             frames.append(out)
         return frames
 
-    frames_final = _read_all_raw_tabs()
+    global _LAST_GOOD_SHEETS_DATA
+    try:
+        frames_final = _read_all_raw_tabs()
+    except gspread.exceptions.APIError as e:
+        st.warning(f"Google Sheets read failed ({e}); showing last-loaded data until it recovers.")
+        if _LAST_GOOD_SHEETS_DATA is not None:
+            return _LAST_GOOD_SHEETS_DATA
+        return pd.DataFrame(columns=_SHEETS_DATA_COLUMNS)
 
-    if not frames_final:
-        return pd.DataFrame(
-            columns=[
-                "User", "Date", "DateTime", "Strategy", "Template", "Right", "Strike",
-                "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
-                "__source_tab",
-            ]
-        )
-
-    return pd.concat(frames_final, ignore_index=True)
+    result = (
+        pd.DataFrame(columns=_SHEETS_DATA_COLUMNS)
+        if not frames_final
+        else pd.concat(frames_final, ignore_index=True)
+    )
+    _LAST_GOOD_SHEETS_DATA = result
+    return result
 
 
 # ========================
