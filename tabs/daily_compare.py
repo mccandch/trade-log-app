@@ -20,33 +20,6 @@ from dateutil.relativedelta import relativedelta
 # =========================
 # CSS helpers (runtime only)
 # =========================
-def _render_ema_b_schedule(today_only: bool = True) -> None:
-    """Show EMA-B time buckets. Default: only the current day."""
-    day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-    today_name = date.today().strftime("%A")
-
-    def _rows(kind: str):
-        days = [today_name] if today_only else day_order
-        return [{"Day": d, "Start-End (ET)": ", ".join(EMA_B_SCHEDULE[kind].get(d, [])) or "—"} for d in days]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**📈 Put Buckets (EMA20 > EMA40)**")
-        _df_no_index(pd.DataFrame(_rows("Put")))
-    with c2:
-        st.markdown("**📉 Call Buckets (EMA20 < EMA40)**")
-        _df_no_index(pd.DataFrame(_rows("Call")))
-
-
-def _df_no_index(df: pd.DataFrame):
-    """Render a dataframe without showing its index/row numbers."""
-    st.dataframe(
-        df.reset_index(drop=True),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
 def _aggrid_css() -> None:
     """Inject CSS for centered headers and tight spacing. Call at the start of the tab."""
     st.markdown(
@@ -405,26 +378,6 @@ ALIAS = {
     "EMA-T": "EMA-T",
     "EMA-1x": "EMA-1x",
     "EMA-B": "EMA-B",
-}
-
-# ========================
-# EMA-B schedule (ET)
-# ========================
-EMA_B_SCHEDULE = {
-    "Put": {
-        "Monday":    ["10:00-10:30", "10:45-11:45", "12:15-12:30", "14:00-15:00", "15:15-15:30"],
-        "Tuesday":   ["10:30-11:00", "12:45-13:30", "14:00-14:15", "14:30-15:30"],
-        "Wednesday": ["11:15-11:30", "11:45-12:15", "13:00-13:15"],
-        "Thursday":  ["10:00-10:15", "14:30-14:45", "15:15-15:30"],
-        "Friday":    ["11:15-13:00", "14:00-14:15", "15:30-15:45"],
-    },
-    "Call": {
-        "Monday":    ["10:00-10:30", "10:45-11:00", "11:15-11:30", "13:45-14:00", "14:30-15:30"],
-        "Tuesday":   ["11:15-11:30", "12:15-12:30", "14:00-14:15", "14:30-16:00"],
-        "Wednesday": ["10:30-12:00", "14:15-15:30", "15:45-16:00"],
-        "Thursday":  ["10:30-10:45", "11:00-11:15", "11:30-12:15", "12:45-13:15", "13:45-14:30"],
-        "Friday":    ["09:30-10:45", "12:15-12:30", "13:45-14:15", "14:45-15:45"],
-    },
 }
 
 def _order_key(name: str):
@@ -1093,10 +1046,6 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 def daily_compare_tab():
     _aggrid_css()
     st.subheader("Daily Compare (Google Sheets)")
-
-    show_full = st.checkbox("EMA-B schedule: show full week", value=False, key="dc_sched_fullweek")
-    _render_ema_b_schedule(today_only=not show_full)
-    st.divider()
 
     if st.button("Refresh data", key="dc_btn_refresh"):
         load_sheets_data.clear()
