@@ -286,7 +286,7 @@ def load_sheets_data() -> pd.DataFrame:
                 df["Right"] = pd.NA
 
             keep = [
-                "User", "Date", "DateTime", "Strategy", "Right", "Strike",
+                "User", "Date", "DateTime", "Strategy", "Template", "Right", "Strike",
                 "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
             ]
             cols = [c for c in keep if c in df.columns]
@@ -334,7 +334,7 @@ def load_sheets_data() -> pd.DataFrame:
     if not frames_final:
         return pd.DataFrame(
             columns=[
-                "User", "Date", "DateTime", "Strategy", "Right", "Strike",
+                "User", "Date", "DateTime", "Strategy", "Template", "Right", "Strike",
                 "Premium", "PnL", "Source", "BatchID", "TradeID", "Account",
                 "__source_tab",
             ]
@@ -391,16 +391,24 @@ def _pcr(pnl_sum: float, prem_sum: float) -> float:
 
 
 def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
-    """Return per-strategy PCR%, Win%, Trades, Winners, Losers for a single user's filtered window."""
+    """Return per-strategy/template PCR%, Win%, Trades, Winners, Losers for a single user's filtered window.
+
+    Each strategy is broken out into one row per trade template (the DB's
+    TradeTemplate.Name), so e.g. "VOLGA Days" expands into "EMA-B Calls - VOLGA",
+    "EMA-V Calls - VOLGA", etc.
+    """
     if df_user.empty:
-        return pd.DataFrame(columns=["Strategy", "PCR", "WinRate", "Trades", "Winners", "Losers"])
+        return pd.DataFrame(columns=["Strategy", "Template", "Premium", "PCR", "WinRate", "Trades", "Winners", "Losers"])
 
     dfu = df_user.copy()
     dfu["Premium"] = _numeric_series(dfu, ["Premium", "TotalPremium", "Premium($)"])
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
+    if "Template" not in dfu.columns:
+        dfu["Template"] = ""
+    dfu["Template"] = dfu["Template"].fillna("").astype(str).str.strip()
 
     g = (
-        dfu.groupby("StrategyCanonical", dropna=False)
+        dfu.groupby(["StrategyCanonical", "Template"], dropna=False)
         .agg(
             Premium=("Premium", "sum"),
             PnL=("PnL", "sum"),
@@ -421,12 +429,17 @@ def _user_strategy_pcr(df_user: pd.DataFrame) -> pd.DataFrame:
 
     g.rename(columns={"StrategyCanonical": "Strategy"}, inplace=True)
     g["Strategy"] = g["Strategy"].astype(str)
-    g = g.sort_values("Strategy", key=lambda s: s.map(_order_key))
+    g["Template"] = g["Template"].astype(str)
+    # Order by strategy (preferred order), then template name within each strategy.
+    g = g.sort_values(
+        by=["Strategy", "Template"],
+        key=lambda col: col.map(_order_key) if col.name == "Strategy" else col.str.lower(),
+    )
 
     for c in ("Trades", "Winners", "Losers"):
         g[c] = g[c].fillna(0).astype(int)
 
-    return g[["Strategy", "Premium", "PCR", "WinRate", "Trades", "Winners", "Losers"]]
+    return g[["Strategy", "Template", "Premium", "PCR", "WinRate", "Trades", "Winners", "Losers"]]
 
 
 def render_trades_table(trades: pd.DataFrame, title: str):
@@ -678,15 +691,21 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 
     stats["Canonical"] = stats["Strategy"].astype(str)
     stats["Strategy"] = stats["Canonical"].map(lambda s: DISPLAY_ALIAS.get(s, s))
+    stats["Template"] = stats["Template"].fillna("").astype(str)
 
     stats["PCR %"] = stats["PCR"].round(1)
     stats["Win %"] = stats["WinRate"].round(1)
 
     dfu["PnL"] = _numeric_series(dfu, ["PnL", "ProfitLoss", "P/L", "PL"])
-    pnl_map = dfu.groupby("StrategyCanonical", dropna=False)["PnL"].sum().to_dict()
-    stats["PnL"] = stats["Canonical"].map(pnl_map).fillna(0.0)
+    if "Template" not in dfu.columns:
+        dfu["Template"] = ""
+    dfu["Template"] = dfu["Template"].fillna("").astype(str).str.strip()
+    pnl_map = dfu.groupby(["StrategyCanonical", "Template"], dropna=False)["PnL"].sum().to_dict()
+    stats["PnL"] = stats.apply(
+        lambda r: pnl_map.get((r["Canonical"], r["Template"]), 0.0), axis=1
+    )
 
-    stats_for_grid = stats[["Strategy", "Canonical", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
+    stats_for_grid = stats[["Strategy", "Template", "Canonical", "PCR %", "Win %", "Premium", "Trades", "Winners", "Losers", "PnL"]].copy()
 
     # ---- compute header badges (uses numeric sums, not the formatted strings)
     if stats_for_grid.empty:
@@ -777,6 +796,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     """)
 
     gb.configure_column("Strategy", headerClass="dc-center")
+    gb.configure_column("Template", headerClass="dc-center", cellStyle={"textAlign": "left"})
     gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Premium", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
@@ -808,6 +828,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 
         const capsByName = {
           "Strategy": 140,
+          "Template": 220,
           "PCR": 70,
           "Win rate": 90,
           "Premium": 110,
@@ -865,13 +886,16 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 
     selected_rows = _extract_selected_rows(grid)
 
-    picked_canonical = [
-        r.get("Canonical") for r in selected_rows
+    # Each selectable row is a (strategy, template) pair — return composite keys so
+    # the trade table filters down to the exact template rows the user checked.
+    picked_keys = [
+        f"{r.get('Canonical')}||{str(r.get('Template') or '').strip()}"
+        for r in selected_rows
         if isinstance(r, dict) and r.get("Canonical")
     ]
 
-    st.session_state[f"dc_sel_{user}"] = picked_canonical
-    return picked_canonical
+    st.session_state[f"dc_sel_{user}"] = picked_keys
+    return picked_keys
 
     # =========================
     # AG Grid (format + sizing)
@@ -1147,10 +1171,20 @@ def daily_compare_tab():
             df_user = view[view["User"] == user].copy()
             if "StrategyCanonical" not in df_user.columns:
                 df_user["StrategyCanonical"] = normalize_strategy_series(df_user.get("Strategy", pd.Series([""] * len(df_user))))
-            picked_strats = render_user_table_with_toggles(user, df_user)
-            trades = df_user[df_user["StrategyCanonical"].isin(picked_strats)].copy() if picked_strats else df_user.copy()
+            if "Template" not in df_user.columns:
+                df_user["Template"] = ""
+            picked_keys = render_user_table_with_toggles(user, df_user)
+            if picked_keys:
+                key_col = (
+                    df_user["StrategyCanonical"].astype(str)
+                    + "||"
+                    + df_user["Template"].fillna("").astype(str).str.strip()
+                )
+                trades = df_user[key_col.isin(set(picked_keys))].copy()
+            else:
+                trades = df_user.copy()
             trades = trades[trades["Right"].isin(["C", "P"])]
-            user_data.append((user, trades, bool(picked_strats)))
+            user_data.append((user, trades, bool(picked_keys)))
 
     cols = st.columns(len(users))
     for col, (user, trades, has_selection) in zip(cols, user_data):

@@ -42,8 +42,9 @@ warnings.filterwarnings("ignore", message=r".*utcfromtimestamp\(\) is deprecated
 HEADER = [
     "User", "DateTime", "Source", "TradeID", "Account",
     "Strategy", "Right", "Strike", "Premium", "PnL", "BatchID",
+    "Template",
 ]
-_COL_END = chr(ord("A") + len(HEADER) - 1)  # "K"
+_COL_END = chr(ord("A") + len(HEADER) - 1)  # "L"
 _TID_IDX = HEADER.index("TradeID")           # 3 (0-based)
 
 # ---- Module-level sync state (reset on process restart → forces full sync at startup) ----
@@ -179,20 +180,21 @@ def pull_trades_df(con: sqlite3.Connection, days: int = LOOKBACK_DAYS) -> pd.Dat
 
     rows = cur.execute(
         """
-        SELECT TradeID, Account, Strategy, DateOpened,
-               TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day,
-               ShortCall, ShortPut
-        FROM Trade
-        WHERE DateOpened >= ?
-           OR (Year IS NOT NULL AND Year * 10000 + Month * 100 + Day >= ?)
-        ORDER BY TradeID ASC
+        SELECT t.TradeID, t.Account, t.Strategy, t.DateOpened,
+               t.TotalPremium, t.ProfitLoss, t.OrderIDOpen, t.Year, t.Month, t.Day,
+               t.ShortCall, t.ShortPut, tt.Name
+        FROM Trade t
+        LEFT JOIN TradeTemplate tt ON t.TradeTemplateID = tt.TradeTemplateID
+        WHERE t.DateOpened >= ?
+           OR (t.Year IS NOT NULL AND t.Year * 10000 + t.Month * 100 + t.Day >= ?)
+        ORDER BY t.TradeID ASC
         """,
         (cutoff_ticks, cutoff_ymd),
     ).fetchall()
 
     src = os.path.basename(DB_PATH)
     items = []
-    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day, ShortCall, ShortPut in rows:
+    for TradeID, Account, Strategy, DateOpened, TotalPremium, ProfitLoss, OrderIDOpen, Year, Month, Day, ShortCall, ShortPut, Template in rows:
         if not accounts_ok(Account):
             continue
         dt = ticks_to_dt_utc(DateOpened)
@@ -224,6 +226,7 @@ def pull_trades_df(con: sqlite3.Connection, days: int = LOOKBACK_DAYS) -> pd.Dat
             "Premium":  float(TotalPremium) if TotalPremium is not None else None,
             "PnL":      float(ProfitLoss)   if ProfitLoss   is not None else None,
             "BatchID":  batch_id,
+            "Template": Template or "",
         })
 
     df = pd.DataFrame(items)
