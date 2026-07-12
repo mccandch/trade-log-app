@@ -759,7 +759,110 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         st.caption("No strategies found for this user in the selected date range.")
         return []
 
-    gb = GridOptionsBuilder.from_dataframe(stats_for_grid)
+    # ---- Roll template-level rows up into one summary row per strategy ----
+    templates_by_strategy = {
+        canon: g.sort_values("Template", key=lambda c: c.str.lower())
+        for canon, g in stats_for_grid.groupby("Canonical")
+    }
+
+    strategy_totals = (
+        stats_for_grid.groupby(["Canonical", "Strategy"], dropna=False)
+        .agg(
+            Premium=("Premium", "sum"),
+            Trades=("Trades", "sum"),
+            Winners=("Winners", "sum"),
+            Losers=("Losers", "sum"),
+            PnL=("PnL", "sum"),
+        )
+        .reset_index()
+    )
+    strategy_totals["PCR %"] = strategy_totals.apply(
+        lambda r: round(_pcr(r["PnL"], r["Premium"]), 1), axis=1
+    )
+    denom = strategy_totals["Winners"] + strategy_totals["Losers"]
+    strategy_totals["Win %"] = np.where(
+        denom > 0, (strategy_totals["Winners"] / denom * 100.0).round(1), np.nan
+    )
+    strategy_totals = strategy_totals.sort_values(
+        by="Canonical", key=lambda c: c.map(_order_key)
+    )
+
+    # ---- Expand/collapse toggle row (one button per multi-template strategy) ----
+    expandable = [
+        (row["Strategy"], row["Canonical"])
+        for _, row in strategy_totals.iterrows()
+        if len(templates_by_strategy.get(row["Canonical"], [])) > 1
+    ]
+    if expandable:
+        btn_cols = st.columns(len(expandable))
+        for bcol2, (disp_name, canonical) in zip(btn_cols, expandable):
+            expand_key = f"dc_expand_{safe_key}_{canonical}"
+            is_expanded = st.session_state.get(expand_key, False)
+            label = f"{'▼' if is_expanded else '▶'} {disp_name}"
+            if bcol2.button(label, key=f"dc_toggle_{safe_key}_{canonical}", use_container_width=True):
+                st.session_state[expand_key] = not is_expanded
+                _rerun()
+
+    # ---- Build the combined (summary + optionally expanded template) rows ----
+    combined_rows = []
+    for _, srow in strategy_totals.iterrows():
+        canonical = srow["Canonical"]
+        templates = templates_by_strategy.get(canonical, pd.DataFrame())
+        n_templates = len(templates)
+
+        if n_templates <= 1:
+            single_template = templates["Template"].iloc[0] if n_templates == 1 else ""
+            combined_rows.append({
+                "IsSummary": True,
+                "Strategy": srow["Strategy"],
+                "Template": single_template,
+                "Canonical": canonical,
+                "TemplateKey": single_template,
+                "PCR %": srow["PCR %"],
+                "Win %": srow["Win %"],
+                "Premium": srow["Premium"],
+                "Trades": srow["Trades"],
+                "Winners": srow["Winners"],
+                "Losers": srow["Losers"],
+                "PnL": srow["PnL"],
+            })
+            continue
+
+        is_expanded = st.session_state.get(f"dc_expand_{safe_key}_{canonical}", False)
+        combined_rows.append({
+            "IsSummary": True,
+            "Strategy": srow["Strategy"],
+            "Template": "",
+            "Canonical": canonical,
+            "TemplateKey": "__ALL__",
+            "PCR %": srow["PCR %"],
+            "Win %": srow["Win %"],
+            "Premium": srow["Premium"],
+            "Trades": srow["Trades"],
+            "Winners": srow["Winners"],
+            "Losers": srow["Losers"],
+            "PnL": srow["PnL"],
+        })
+        if is_expanded:
+            for _, trow in templates.iterrows():
+                combined_rows.append({
+                    "IsSummary": False,
+                    "Strategy": "",
+                    "Template": trow["Template"],
+                    "Canonical": canonical,
+                    "TemplateKey": trow["Template"],
+                    "PCR %": trow["PCR %"],
+                    "Win %": trow["Win %"],
+                    "Premium": trow["Premium"],
+                    "Trades": trow["Trades"],
+                    "Winners": trow["Winners"],
+                    "Losers": trow["Losers"],
+                    "PnL": trow["PnL"],
+                })
+
+    combined = pd.DataFrame(combined_rows)
+
+    gb = GridOptionsBuilder.from_dataframe(combined)
     gb.configure_selection("multiple", use_checkbox=True)
     gb.configure_default_column(
         cellStyle={"textAlign": "center"},
@@ -767,8 +870,10 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         minWidth=60,
     )
 
-    # Hidden canonical column (still returned in selected_rows)
+    # Hidden helper columns (still returned in selected_rows)
     gb.configure_column("Canonical", hide=True)
+    gb.configure_column("TemplateKey", hide=True)
+    gb.configure_column("IsSummary", hide=True)
 
     pctFmt = JsCode("""
       function(p){
@@ -796,8 +901,18 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
       }
     """)
 
+    templateCellStyle = JsCode("""
+      function(p){
+        const style = {textAlign: 'left'};
+        if (p.data && p.data.IsSummary === false) {
+          style.paddingLeft = '28px';
+        }
+        return style;
+      }
+    """)
+
     gb.configure_column("Strategy", headerClass="dc-center")
-    gb.configure_column("Template", headerClass="dc-center", cellStyle={"textAlign": "left"})
+    gb.configure_column("Template", headerClass="dc-center", cellStyle=templateCellStyle)
     gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Premium", headerClass="dc-center", type=["numericColumn"], valueFormatter=moneyFmt)
@@ -809,10 +924,13 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     row_style = JsCode("""
       function(params){
         const v = Number(params.data["PCR %"]);
-        if (isNaN(v)) return null;
+        const isSummary = params.data["IsSummary"];
+        let bg = "transparent";
+        if (!isNaN(v)) bg = (v>0) ? "#143d2b" : (v<0 ? "#4b1f1f" : "transparent");
         return {
-          backgroundColor: (v>0) ? "#143d2b" : (v<0 ? "#4b1f1f" : "transparent"),
-          color: "white"
+          backgroundColor: bg,
+          color: "white",
+          fontWeight: isSummary ? "700" : "400"
         };
       }
     """)
@@ -820,7 +938,12 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go = gb.build()
     go["getRowStyle"] = row_style
     go["headerHeight"] = 32
+    go["rowHeight"] = 28
     go["suppressSizeToFit"] = True
+
+    # Size the grid to the actual row count instead of a fixed viewport, so a
+    # collapsed strategy (1 row) doesn't leave a tall empty area below it.
+    grid_height = 32 + max(1, len(combined)) * 28 + 4
 
     autoSizeJs = JsCode("""
       function(params){
@@ -858,14 +981,20 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go["onGridSizeChanged"]  = autoSizeJs
 
     _dr = st.session_state.get("dc_date_range", ("", ""))
+    # st_aggrid only pushes the iframe height to Streamlit when the component
+    # mounts, so a fixed key would leave the old (taller) iframe in place after
+    # collapsing. Bake the row count into the key to force a remount whenever
+    # a strategy is expanded/collapsed. (Side effect: checkbox selections reset
+    # on expand/collapse, which is acceptable.)
     grid = AgGrid(
-        stats_for_grid,
+        combined,
         gridOptions=go,
+        height=grid_height,
         theme="streamlit",
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=False,
-        key=f"dc_grid_{user}_{_dr[0]}_{_dr[1]}",
+        key=f"dc_grid_{user}_{_dr[0]}_{_dr[1]}_{len(combined)}",
     )
 
     def _extract_selected_rows(g):
@@ -887,13 +1016,24 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 
     selected_rows = _extract_selected_rows(grid)
 
-    # Each selectable row is a (strategy, template) pair — return composite keys so
-    # the trade table filters down to the exact template rows the user checked.
-    picked_keys = [
-        f"{r.get('Canonical')}||{str(r.get('Template') or '').strip()}"
-        for r in selected_rows
-        if isinstance(r, dict) and r.get("Canonical")
-    ]
+    # Each selectable row is either a per-template row, or a collapsed strategy
+    # summary row (TemplateKey == "__ALL__") that stands in for all of its
+    # templates. Expand summary selections back into composite keys so the
+    # trade table filters down to the exact template rows they represent.
+    picked_keys: list[str] = []
+    for r in selected_rows:
+        if not isinstance(r, dict):
+            continue
+        canonical = r.get("Canonical")
+        if not canonical:
+            continue
+        if r.get("TemplateKey") == "__ALL__":
+            sub = templates_by_strategy.get(canonical, pd.DataFrame())
+            picked_keys.extend(
+                f"{canonical}||{str(t).strip()}" for t in sub.get("Template", [])
+            )
+        else:
+            picked_keys.append(f"{canonical}||{str(r.get('TemplateKey') or '').strip()}")
 
     st.session_state[f"dc_sel_{user}"] = picked_keys
     return picked_keys
