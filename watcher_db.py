@@ -236,6 +236,65 @@ def pull_trades_df(con: sqlite3.Connection, days: int = LOOKBACK_DAYS) -> pd.Dat
     return df[HEADER].copy()
 
 
+# ================== FOREIGN-ROW GUARD ==================
+
+def db_account_set(con: sqlite3.Connection) -> set:
+    """All account ids that have ever appeared in this machine's DB."""
+    rows = con.execute(
+        "SELECT DISTINCT Account FROM Trade WHERE Account IS NOT NULL AND Account != ''"
+    ).fetchall()
+    return {str(r[0]).strip() for r in rows}
+
+
+def purge_foreign_rows(ws, db_accounts: set) -> int:
+    """Delete sheet rows whose Account never appears in the local DB.
+
+    A misconfigured watcher clone on another machine (USER_NAME set to this
+    user but reading a different TAT database) once appended 1,800+ rows of
+    someone else's trades into this tab. Every legitimate row here originates
+    from this machine's DB, so an unknown Account is a reliable discriminator.
+    Blank-Account rows are left alone.
+    """
+    if not db_accounts:
+        return 0  # can't tell local from foreign — don't delete anything
+    acct_col = chr(ord("A") + HEADER.index("Account"))
+    col = ws.get_values(f"{acct_col}2:{acct_col}")
+    bad_rows = [
+        i + 2
+        for i, v in enumerate(col)
+        if v and str(v[0]).strip() and str(v[0]).strip() not in db_accounts
+    ]
+    if not bad_rows:
+        return 0
+    # Group contiguous row numbers into ranges and delete bottom-up so the
+    # remaining ranges' indexes stay valid as rows shift.
+    ranges = []
+    start = prev = bad_rows[0]
+    for r in bad_rows[1:]:
+        if r == prev + 1:
+            prev = r
+        else:
+            ranges.append((start, prev))
+            start = prev = r
+    ranges.append((start, prev))
+    requests = [
+        {"deleteDimension": {"range": {
+            "sheetId": ws.id,
+            "dimension": "ROWS",
+            "startIndex": s - 1,   # 0-based inclusive
+            "endIndex": e,         # 0-based exclusive
+        }}}
+        for s, e in sorted(ranges, reverse=True)
+    ]
+    ws.spreadsheet.batch_update({"requests": requests})
+    print(
+        f"  purge: deleted {len(bad_rows)} foreign-account rows "
+        f"in {len(ranges)} block(s)",
+        flush=True,
+    )
+    return len(bad_rows)
+
+
 # ================== SHEET READ ==================
 
 def read_sheet_df(ws) -> pd.DataFrame:
@@ -353,6 +412,10 @@ def full_sync(ws) -> None:
     global _last_full_sync
     with sqlite3.connect(DB_PATH) as con:
         db_df = pull_trades_df(con, days=LOOKBACK_DAYS)
+        db_accounts = db_account_set(con)
+
+    # Guard: drop rows a misconfigured watcher on another machine wrote here.
+    purge_foreign_rows(ws, db_accounts)
 
     # Read the sheet as it actually exists right now.
     sheet_df = read_sheet_df(ws)
