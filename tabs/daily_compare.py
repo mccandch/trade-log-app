@@ -943,7 +943,9 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
 
     # Size the grid to the actual row count instead of a fixed viewport, so a
     # collapsed strategy (1 row) doesn't leave a tall empty area below it.
-    grid_height = 32 + max(1, len(combined)) * 28 + 4
+    # Extra 20px: when columns overflow, AG Grid's horizontal scrollbar takes
+    # ~17px of the viewport, which used to clip the last row entirely.
+    grid_height = 32 + max(1, len(combined)) * 28 + 24
 
     autoSizeJs = JsCode("""
       function(params){
