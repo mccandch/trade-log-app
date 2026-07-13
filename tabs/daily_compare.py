@@ -941,12 +941,6 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go["rowHeight"] = 28
     go["suppressSizeToFit"] = True
 
-    # Size the grid to the actual row count instead of a fixed viewport, so a
-    # collapsed strategy (1 row) doesn't leave a tall empty area below it.
-    # Extra 20px: when columns overflow, AG Grid's horizontal scrollbar takes
-    # ~17px of the viewport, which used to clip the last row entirely.
-    grid_height = 32 + max(1, len(combined)) * 28 + 24
-
     autoSizeJs = JsCode("""
       function(params){
         const ids = params.columnApi.getAllDisplayedColumns().map(c => c.getColId());
@@ -983,6 +977,10 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     go["onGridSizeChanged"]  = autoSizeJs
 
     _dr = st.session_state.get("dc_date_range", ("", ""))
+    # height=None enables AG Grid's autoHeight layout: the grid renders all
+    # rows and the iframe grows to fit, so nothing gets clipped by the
+    # horizontal scrollbar (or cut off without a way to scroll on mobile,
+    # where a hand-computed pixel height used to do exactly that).
     # st_aggrid only pushes the iframe height to Streamlit when the component
     # mounts, so a fixed key would leave the old (taller) iframe in place after
     # collapsing. Bake the row count into the key to force a remount whenever
@@ -991,7 +989,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     grid = AgGrid(
         combined,
         gridOptions=go,
-        height=grid_height,
+        height=None,
         theme="streamlit",
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
