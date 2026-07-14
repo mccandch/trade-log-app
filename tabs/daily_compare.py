@@ -870,10 +870,13 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         minWidth=60,
     )
 
-    # Hidden helper columns (still returned in selected_rows)
+    # Hidden helper columns (still returned in selected_rows).
+    # configure_selection(use_checkbox=True) drops checkboxSelection on the
+    # dataframe's FIRST column, which is IsSummary — hidden, so the checkbox
+    # never renders. Strip it here and put it on Strategy instead.
     gb.configure_column("Canonical", hide=True)
     gb.configure_column("TemplateKey", hide=True)
-    gb.configure_column("IsSummary", hide=True)
+    gb.configure_column("IsSummary", hide=True, checkboxSelection=False)
 
     pctFmt = JsCode("""
       function(p){
@@ -911,7 +914,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
       }
     """)
 
-    gb.configure_column("Strategy", headerClass="dc-center")
+    gb.configure_column("Strategy", headerClass="dc-center", checkboxSelection=True)
     gb.configure_column("Template", headerClass="dc-center", cellStyle=templateCellStyle)
     gb.configure_column("PCR %", header_name="PCR", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
     gb.configure_column("Win %", header_name="Win rate", headerClass="dc-center", type=["numericColumn"], valueFormatter=pctFmt)
@@ -947,7 +950,7 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
         params.columnApi.autoSizeColumns(ids, true);
 
         const capsByName = {
-          "Strategy": 140,
+          "Strategy": 175,
           "Template": 220,
           "PCR": 70,
           "Win rate": 90,
@@ -998,20 +1001,25 @@ def render_user_table_with_toggles(user: str, df_user: pd.DataFrame) -> list[str
     )
 
     def _extract_selected_rows(g):
-        rows = None
-        if isinstance(g, dict):
-            rows = g.get("selected_rows") or g.get("selectedRows")
-        if rows is None:
+        # st_aggrid >=1.0 returns selected_rows as a DataFrame (or None); older
+        # versions returned a list of dicts. Never combine candidates with
+        # `or`: DataFrame truthiness raises ValueError, silently losing the
+        # selection inside a try/except.
+        candidates = []
+        for attr in ("selected_rows", "selectedRows"):
             try:
-                rows = getattr(g, "selected_rows", None) or getattr(g, "selectedRows", None)
+                if isinstance(g, dict):
+                    candidates.append(g.get(attr))
+                else:
+                    candidates.append(getattr(g, attr, None))
             except Exception:
-                rows = None
-        if rows is None:
-            return []
-        if isinstance(rows, pd.DataFrame):
-            return rows.to_dict("records")
-        if isinstance(rows, list):
-            return rows
+                candidates.append(None)
+        for rows in candidates:
+            if isinstance(rows, pd.DataFrame):
+                if not rows.empty:
+                    return rows.to_dict("records")
+            elif isinstance(rows, list) and rows:
+                return rows
         return []
 
     selected_rows = _extract_selected_rows(grid)
