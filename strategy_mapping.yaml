@@ -110,6 +110,19 @@ rules:
     match: "PH"
     canonical: "PH"
 
+  # =========================
+  # VOLGA Megatrend unify (backtest "VOLGA Megatrend Calls/Puts" and
+  # "VOLGA Mega Calls/Puts" -> the live-side "VOLGA Mega" buckets)
+  # =========================
+  - source: backtest
+    match: '(?i)^volga\s+mega(trend)?\s+calls?$'
+    canonical: "VOLGA Mega Calls"
+    regex: true
+  - source: backtest
+    match: '(?i)^volga\s+mega(trend)?\s+puts?$'
+    canonical: "VOLGA Mega Puts"
+    regex: true
+
   # Ignore Megatrend on the live side
   - source: live
     match: "Megatrend"

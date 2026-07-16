@@ -299,6 +299,10 @@ def lvb_volga_live_category(strategy, template, side) -> Optional[str]:
     # Day type: "NON VOLGA" -> non-VOLGA day; anything else VOLGA-tagged -> VOLGA day.
     if re.search(r"non\s*volga", text, re.I):
         return f"Non VOLGA Days: {side_word}"
+    # Calls opened on a put day (templates like "EMA-B Calls - VOLGA (Put Day)")
+    # are their own backtest bucket.
+    if side == "Call" and re.search(r"put\s*day", tmpl, re.I):
+        return "VOLGA: Calls on Put Day"
     return f"VOLGA: {side_word}"
 
 
