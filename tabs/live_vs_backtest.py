@@ -306,12 +306,56 @@ def lvb_volga_live_category(strategy, template, side) -> Optional[str]:
     return f"VOLGA: {side_word}"
 
 
+def lvb_live_strikes(row) -> str:
+    """Strikes for a live row, e.g. '6900/6800 P' (short/long) or
+    '6900/6800 P + 7000/7100 C' when both sides are present."""
+    parts = []
+    for short_col, long_col, letter in (("ShortPut", "LongPut", "P"),
+                                        ("ShortCall", "LongCall", "C")):
+        ks = [pd.to_numeric(row.get(c), errors="coerce") for c in (short_col, long_col)]
+        ks = [k for k in ks if pd.notna(k) and k != 0]
+        if ks:
+            parts.append("/".join(f"{k:g}" for k in ks) + f" {letter}")
+    return " + ".join(parts)
+
+
+def lvb_backtest_strikes(legs: str) -> str:
+    """Strikes from a backtest Legs string, e.g.
+    '1 Feb 19 6855 C STO 2.05 | 1 Feb 19 6955 C BTO 0.05' -> '6855/6955 C'."""
+    found: List[Tuple[str, str]] = []
+    for leg in str(legs).split("|"):
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+([CP])\s+(?:STO|BTO)\b", leg, re.I)
+        if m:
+            found.append((m.group(1), m.group(2).upper()))
+    parts = []
+    for letter in ("P", "C"):
+        ks = [k for k, l in found if l == letter]
+        if ks:
+            parts.append("/".join(f"{float(k):g}" for k in ks) + f" {letter}")
+    return " + ".join(parts)
+
+
 def lvb_normalize_live(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
     df = df[df.get("Strategy","") != "Megatrend"].copy()
     df["StrategyMapped"] = df["Strategy"].apply(lambda x: lvb_map_strategy_name("live", x)[0])
     df["PremiumSold"] = _num_col(df, "TotalPremium", 0.0).abs().round(2)
+    df["Credit"] = _num_col(df, "PriceOpen", np.nan).abs().round(2)
+    df["Strikes"] = df.apply(lvb_live_strikes, axis=1) if not df.empty else ""
     df["PnL"] = _num_col(df, "ProfitLoss", 0.0)
+    # Slippage measured the same way as the backtest side (see lvb_apply_backtest_slippage):
+    # what the fill cost above the stop target. Positive = filled worse than target.
+    # The log's own "Slippage" column measures against the trigger price instead, so it's
+    # kept only for reference under SlippageLogged.
+    df["SlippageLogged"] = _num_col(df, "Slippage", np.nan).round(2)
+    _target = _num_col(df, "PriceStopTarget", np.nan).abs()
+    _close = _num_col(df, "PriceClose", np.nan).abs()
+    _stopped = (
+        df["Status"].astype(str).str.contains("stop", case=False, na=False)
+        if "Status" in df.columns else pd.Series(True, index=df.index)
+    )
+    df["StopTarget"] = _target.where(_stopped & (_target > 0))
+    df["Slippage"] = (_close - _target).where(_stopped & (_target > 0)).round(2)
     df["PnL_rounded"] = df["PnL"].round(2)
     df["PnL_stats"] = df["PnL_rounded"]
     if "TradeType" in df.columns:
@@ -404,6 +448,18 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
     close_is_price = df["Avg. Closing Cost"] < 50
     close_total = df["Avg. Closing Cost"].where(~close_is_price, df["Avg. Closing Cost"] * 100 * contracts).fillna(0)
     df["PnL_gross"] = (df["PremiumSold"] - close_total).round(2)
+
+    # Per-contract closing price of the spread ("Avg. Closing Cost" is quoted in
+    # cents-per-contract once it gets large, e.g. 320 -> $3.20). Used for slippage.
+    _acc = df["Avg. Closing Cost"]
+    df["_ClosePricePer"] = np.where(_acc.abs() >= 50, _acc / 100.0, _acc)
+    # Only stop-outs can have slippage; expirations/targets close at their own price.
+    if "Reason For Close" in df.columns:
+        df["_IsStopped"] = df["Reason For Close"].astype(str).str.contains("stop", case=False, na=False)
+    else:
+        df["_IsStopped"] = df["_ClosePricePer"] > 0
+    df["_SplitRow"] = False
+
     df["_PnL_net"] = _num(df.get("P/L")).round(2) if "P/L" in df.columns else np.nan
     df["PnL_stats"] = df["_PnL_net"].where(df["_PnL_net"].notna(), df["PnL_gross"]).fillna(0)
 
@@ -451,6 +507,9 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
                     nr = row.copy()
                     nr["Side"] = side
                     nr["Legs"] = " | ".join(legs_list)
+                    # "Avg. Closing Cost" covers both sides, so a per-side stop
+                    # price can't be recovered — leave slippage blank for these.
+                    nr["_SplitRow"] = True
                     nr["PremiumSold"] = round(float(row.get("PremiumSold", 0)) * ratio, 2)
                     for c in ("PnL_stats", "PnL_gross", "PnL_rounded"):
                         if c in nr.index and pd.notna(row.get(c)):
@@ -458,7 +517,52 @@ def lvb_normalize_backtest(raw: pd.DataFrame) -> pd.DataFrame:
                     new_rows.append(nr)
             df = pd.concat([df[~_combined], pd.DataFrame(new_rows)], ignore_index=True)
 
+    # Strikes + per-contract credit, derived after the split so each side
+    # reports only its own legs.
+    if "Legs" in df.columns:
+        df["Strikes"] = df["Legs"].apply(lvb_backtest_strikes)
+        df["Credit"] = df["Legs"].apply(_credit_per_contract).round(2)
+    else:
+        df["Strikes"] = ""
+        df["Credit"] = np.nan
+    # Fall back to the Premium column when the legs didn't yield a credit
+    # (Premium is the per-contract credit in cents, e.g. 145 -> $1.45).
+    _prem = pd.to_numeric(df.get("Premium"), errors="coerce")
+    _prem_credit = pd.Series(np.where(_prem.abs() >= 50, _prem / 100.0, _prem), index=df.index)
+    df["Credit"] = df["Credit"].fillna(_prem_credit).round(2)
+
     return df
+
+
+def lvb_apply_backtest_slippage(df: pd.DataFrame, multiples: Dict[str, float],
+                                default_multiple: float = 1.0) -> pd.DataFrame:
+    """Derive per-trade stop slippage for backtest rows.
+
+    Backtest logs record the credit and the closing cost but never the stop
+    price, so the stop is assumed to sit at ``credit x (1 + multiple)`` — i.e. a
+    1x net stop by default (collect $1.45, stop at $2.90). Slippage is then the
+    amount paid above that stop; positive = filled worse than the stop.
+    """
+    out = df.copy()
+    if out.empty:
+        out["StopPrice"] = pd.Series(dtype=float)
+        out["Slippage"] = pd.Series(dtype=float)
+        return out
+
+    credit = pd.to_numeric(out.get("Credit"), errors="coerce")
+    mult = out["StrategyMapped"].map(
+        lambda s: float(multiples.get(s, default_multiple))
+    ).astype(float)
+    stop_price = credit.abs() * (1.0 + mult)
+    close_price = pd.to_numeric(out.get("_ClosePricePer"), errors="coerce")
+
+    stopped = out.get("_IsStopped", pd.Series(True, index=out.index)).fillna(False).astype(bool)
+    if "_SplitRow" in out.columns:
+        stopped &= ~out["_SplitRow"].fillna(False).astype(bool)
+
+    out["StopPrice"] = stop_price.where(stopped).round(2)
+    out["Slippage"] = (close_price - stop_price).where(stopped).round(2)
+    return out
 
 
 def lvb_prepare_for_stats(df: pd.DataFrame, view: str) -> Tuple[pd.DataFrame, str]:
@@ -475,13 +579,18 @@ def lvb_prepare_for_stats(df: pd.DataFrame, view: str) -> Tuple[pd.DataFrame, st
 
 def lvb_compute_strategy_stats(df: pd.DataFrame, strat_col: str = "StrategyKey", pnl_col: str = "PnL_stats") -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame(columns=[strat_col, "Trades", "Win Rate %", "Premium Sold", "Premium Captured", "PCR %"])
-    g = df.groupby(strat_col).agg(
-        Trades=(pnl_col, "size"),
-        **{"Win Rate %": (pnl_col, lambda x: (pd.to_numeric(x, errors="coerce") > 0).mean() * 100.0)},
-        **{"Premium Sold": ("PremiumSold", lambda x: pd.to_numeric(x, errors="coerce").sum())},
-        **{"Premium Captured": (pnl_col, lambda x: pd.to_numeric(x, errors="coerce").sum())},
-    ).reset_index()
+        return pd.DataFrame(columns=[strat_col, "Trades", "Win Rate %", "Premium Sold",
+                                     "Premium Captured", "PCR %", "Avg Slippage"])
+    aggs = {
+        "Trades": (pnl_col, "size"),
+        "Win Rate %": (pnl_col, lambda x: (pd.to_numeric(x, errors="coerce") > 0).mean() * 100.0),
+        "Premium Sold": ("PremiumSold", lambda x: pd.to_numeric(x, errors="coerce").sum()),
+        "Premium Captured": (pnl_col, lambda x: pd.to_numeric(x, errors="coerce").sum()),
+    }
+    if "Slippage" in df.columns:
+        # Averaged over the trades that actually have a slippage figure (stop-outs).
+        aggs["Avg Slippage"] = ("Slippage", lambda x: pd.to_numeric(x, errors="coerce").mean())
+    g = df.groupby(strat_col).agg(**aggs).reset_index()
     g["PCR %"] = (g["Premium Captured"] / g["Premium Sold"].where(pd.to_numeric(g["Premium Sold"], errors="coerce") != 0, np.nan)) * 100.0
     return g
 
@@ -614,6 +723,17 @@ def lvb_style_table_center_currency_percent(
     styler = styler.set_table_styles([{"selector": "th, td", "props": [("text-align", "center")]}], overwrite=False)
     return styler
 
+def lvb_long_strikes(text) -> Tuple[float, ...]:
+    """Long (protective) strikes from a Strikes string — the second strike of each
+    side, e.g. '6485/6385 P' -> (6385.0). Empty when no long leg is recorded."""
+    out = []
+    for part in str(text).split("+"):
+        ks = re.findall(r"[0-9]+(?:\.[0-9]+)?", part)
+        if len(ks) >= 2:
+            out.append(float(ks[1]))
+    return tuple(out)
+
+
 def lvb_render_table_html(
     df: pd.DataFrame,
     currency_cols: List[str],
@@ -621,10 +741,26 @@ def lvb_render_table_html(
     posneg_cols: List[str],
     pair_band: bool,
     band_stride: int,
+    strike_cols: Optional[Tuple[str, str]] = None,
 ) -> str:
     styler = lvb_style_table_center_currency_percent(
         df, currency_cols, percent_cols, posneg_cols, pair_band, band_stride
     ).set_table_attributes('class="compact-table"')
+
+    # Flag pairs whose long strikes disagree (short strikes are expected to drift).
+    if strike_cols and not df.empty and all(c in df.columns for c in strike_cols):
+        live_col, back_col = strike_cols
+
+        def _flag_long_mismatch(data: pd.DataFrame):
+            styles = pd.DataFrame("", index=data.index, columns=data.columns)
+            for i in data.index:
+                lv, bk = lvb_long_strikes(data.at[i, live_col]), lvb_long_strikes(data.at[i, back_col])
+                if lv != bk and (lv or bk):
+                    styles.loc[i, [live_col, back_col]] = "background-color: rgba(190, 165, 60, 0.30);"
+            return styles
+        # Applied last so it wins over the row banding.
+        styler = styler.apply(_flag_long_mismatch, axis=None)
+
     return styler.to_html()
 
 # ---------------- UI ----------------
@@ -770,6 +906,31 @@ def main():
 
         selected_strats = st.multiselect("Filter strategies", all_strats, default=all_strats, key="strat_picker")
 
+        # Backtest stop multiples → slippage
+        back_strats = sorted(back_sel_full["StrategyMapped"].dropna().unique())
+        with st.expander("Stop multiples (backtest slippage)", expanded=False):
+            st.caption(
+                "Backtest logs don't record the stop price, so it's assumed to sit at "
+                "credit × (1 + multiple) — a 1x net stop by default (collect $1.45 → stop $2.90). "
+                "Slippage is what was paid above that stop. Changing the default resets every override."
+            )
+            stop_default = st.number_input("Default stop multiple", min_value=0.0, max_value=10.0,
+                                           value=1.0, step=0.25, key="lvb_stopmult_default")
+            if st.session_state.get("_lvb_stopmult_last_default") != float(stop_default):
+                for s in back_strats:
+                    st.session_state[f"lvb_stopmult_{s}"] = float(stop_default)
+                st.session_state["_lvb_stopmult_last_default"] = float(stop_default)
+
+            stop_multiples = {}
+            mcols = st.columns(3)
+            for i, s in enumerate(back_strats):
+                stop_multiples[s] = mcols[i % 3].number_input(
+                    s, min_value=0.0, max_value=10.0, value=float(stop_default),
+                    step=0.25, key=f"lvb_stopmult_{s}",
+                )
+
+        back_sel_full = lvb_apply_backtest_slippage(back_sel_full, stop_multiples, float(stop_default))
+
         def _keep(df: pd.DataFrame) -> pd.DataFrame:
             return df[df["StrategyMapped"].isin(selected_strats)].copy()
 
@@ -795,13 +956,13 @@ def main():
             stack_rows.append({"Strategy": strat, "Source": "Live",
                             "Trades": r["Trades (Live)"], "Win Rate %": r["Win Rate % (Live)"],
                             "Premium Sold": r["Premium Sold (Live)"], "Premium Captured": r["Premium Captured (Live)"],
-                            "PCR %": r["PCR % (Live)"]})
+                            "PCR %": r["PCR % (Live)"], "Avg Slippage": r.get("Avg Slippage (Live)", np.nan)})
             stack_rows.append({"Strategy": strat, "Source": "Backtest",
                             "Trades": r["Trades (Backtest)"], "Win Rate %": r["Win Rate % (Backtest)"],
                             "Premium Sold": r["Premium Sold (Backtest)"], "Premium Captured": r["Premium Captured (Backtest)"],
-                            "PCR %": r["PCR % (Backtest)"]})
+                            "PCR %": r["PCR % (Backtest)"], "Avg Slippage": r.get("Avg Slippage (Backtest)", np.nan)})
 
-        expected_cols = ["Strategy","Source","Trades","Win Rate %","Premium Sold","Premium Captured","PCR %"]
+        expected_cols = ["Strategy","Source","Trades","Win Rate %","Premium Sold","Premium Captured","PCR %","Avg Slippage"]
         if stack_rows:
             comparison_stacked = pd.DataFrame(stack_rows)
         else:
@@ -836,8 +997,14 @@ def main():
             c_sum = float(cap.sum())
             pcr   = float((c_sum / s_sum) * 100.0) if s_sum else 0.0
 
+            slip = pd.to_numeric(sub["Avg Slippage"], errors="coerce") if "Avg Slippage" in sub.columns \
+                else pd.Series(np.nan, index=sub.index)
+            w_slip = float((slip * trades)[slip.notna()].sum() / trades[slip.notna()].sum()) \
+                if slip.notna().any() and trades[slip.notna()].sum() > 0 else np.nan
+
             return {"Strategy": "All Selected (Total)", "Source": src, "Trades": t_sum,
-                    "Win Rate %": w_wr, "Premium Sold": s_sum, "Premium Captured": c_sum, "PCR %": pcr}
+                    "Win Rate %": w_wr, "Premium Sold": s_sum, "Premium Captured": c_sum, "PCR %": pcr,
+                    "Avg Slippage": w_slip}
 
 
         totals = []
@@ -854,7 +1021,7 @@ def main():
         band_stride = 2 if st.session_state.source_filter == "Both" else 1
         comp_styler = lvb_style_table_center_currency_percent(
             comparison_stacked,
-            currency_cols=["Premium Sold", "Premium Captured"],
+            currency_cols=["Premium Sold", "Premium Captured", "Avg Slippage"],
             percent_cols=["Win Rate %", "PCR %"],
             posneg_cols=["Premium Captured", "PCR %"],
             pair_band=True,
@@ -1008,21 +1175,36 @@ def main():
         live_trades, live_wr, live_sold, live_cap, live_pcr = agg_summary(lvb_compute_strategy_stats(lvb_prepare_for_stats(live_sel, st.session_state.view_mode)[0], "StrategyKey"))
         back_trades, back_wr, back_sold, back_cap, back_pcr = agg_summary(lvb_compute_strategy_stats(lvb_prepare_for_stats(back_sel, st.session_state.view_mode)[0], "StrategyKey"))
 
+        # Average slippage per stopped trade (rows without a stop have blank slippage
+        # and are excluded from the mean rather than counted as zero).
+        def _avg_slippage(df: pd.DataFrame) -> float:
+            if df is None or df.empty or "Slippage" not in df.columns:
+                return float("nan")
+            return float(pd.to_numeric(df["Slippage"], errors="coerce").mean())
+
+        def _slip_txt(v: float) -> str:
+            return "—" if pd.isna(v) else f"${v:,.2f}"
+
+        live_slip = _avg_slippage(live_sel)
+        back_slip = _avg_slippage(back_sel)
+
         # Live KPIs (wrap in .live-kpis)
-        l1, l2, l3, l4, l5 = st.columns(5)
+        l1, l2, l3, l4, l5, l6 = st.columns(6)
         l1.metric("Live Trades", f"{live_trades:,}")
         l2.metric("Live Win Rate", f"{live_wr:.1f}%")
         l3.metric("Live Premium Sold", f"${live_sold:,.0f}")
         l4.metric("Live Premium Captured", f"${live_cap:,.0f}")
         l5.metric("Live PCR", f"{live_pcr:.1f}%")
+        l6.metric("Live Avg Slippage", _slip_txt(live_slip))
 
         # Backtest KPIs (HTML so we can color them)
-        b1, b2, b3, b4, b5 = st.columns(5)
+        b1, b2, b3, b4, b5, b6 = st.columns(6)
         b1.markdown(metric_html("Backtest Trades", f"{back_trades:,}", gold=True), unsafe_allow_html=True)
         b2.markdown(metric_html("Backtest Win Rate", f"{back_wr:.1f}%", gold=True), unsafe_allow_html=True)
         b3.markdown(metric_html("Backtest Premium Sold", f"${back_sold:,.0f}", gold=True), unsafe_allow_html=True)
         b4.markdown(metric_html("Backtest Premium Captured", f"${back_cap:,.0f}", gold=True), unsafe_allow_html=True)
         b5.markdown(metric_html("Backtest PCR", f"{back_pcr:.1f}%", gold=True), unsafe_allow_html=True)
+        b6.markdown(metric_html("Backtest Avg Slippage", _slip_txt(back_slip), gold=True), unsafe_allow_html=True)
 
         # Tolerance matching + detail tables
         matches = lvb_greedy_match_with_tolerance(live_sel, back_sel, st.session_state.tol_minutes)
@@ -1034,8 +1216,9 @@ def main():
         else:
             live_matched = set(matches["LiveIdx"].tolist())
             back_matched = set(matches["BackIdx"].tolist())
-            live_only = live_sel.loc[~live_sel.index.isin(live_matched), ["OpenDT","StrategyMapped","Side","PremiumSold","PnL_rounded"]].sort_values("OpenDT")
-            back_only = back_sel.loc[~back_sel.index.isin(back_matched), ["OpenDT","StrategyMapped","Side","PremiumSold","PnL_rounded"]].sort_values("OpenDT")
+            _only_cols = ["OpenDT","StrategyMapped","Side","Strikes","Credit","PremiumSold","Slippage","PnL_rounded"]
+            live_only = live_sel.loc[~live_sel.index.isin(live_matched), [c for c in _only_cols if c in live_sel.columns]].sort_values("OpenDT")
+            back_only = back_sel.loc[~back_sel.index.isin(back_matched), [c for c in _only_cols if c in back_sel.columns]].sort_values("OpenDT")
             matched_pairs = matches.copy()
             matched_pairs["Strategy"] = matched_pairs["LiveIdx"].map(live_sel["StrategyMapped"])
             matched_pairs["Side"] = matched_pairs["LiveIdx"].map(live_sel["Side"])
@@ -1046,6 +1229,16 @@ def main():
             matched_pairs["BackPnL"] = matched_pairs["BackIdx"].map(back_sel["PnL_stats"]).round(2)
             matched_pairs["LivePremium"] = matched_pairs["LiveIdx"].map(live_sel["PremiumSold"]).round(2)
             matched_pairs["BackPremium"] = matched_pairs["BackIdx"].map(back_sel["PremiumSold"]).round(2)
+            matched_pairs["LiveStrikes"] = matched_pairs["LiveIdx"].map(live_sel.get("Strikes", pd.Series(dtype=object)))
+            matched_pairs["BackStrikes"] = matched_pairs["BackIdx"].map(back_sel.get("Strikes", pd.Series(dtype=object)))
+            matched_pairs["LiveCredit"] = matched_pairs["LiveIdx"].map(live_sel.get("Credit", pd.Series(dtype=float))).round(2)
+            matched_pairs["BackCredit"] = matched_pairs["BackIdx"].map(back_sel.get("Credit", pd.Series(dtype=float))).round(2)
+            # Both sides measure slippage as fill-minus-stop-target: live uses the logged
+            # PriceStopTarget, backtest the assumed stop (see lvb_apply_backtest_slippage).
+            matched_pairs["LiveStop"] = matched_pairs["LiveIdx"].map(live_sel.get("StopTarget", pd.Series(dtype=float))).round(2)
+            matched_pairs["LiveSlippage"] = matched_pairs["LiveIdx"].map(live_sel.get("Slippage", pd.Series(dtype=float))).round(2)
+            matched_pairs["BackStop"] = matched_pairs["BackIdx"].map(back_sel.get("StopPrice", pd.Series(dtype=float))).round(2)
+            matched_pairs["BackSlippage"] = matched_pairs["BackIdx"].map(back_sel.get("Slippage", pd.Series(dtype=float))).round(2)
             
         if not matches.empty:
             EPS = 0.01  # treat +/- 1 cent as flat
@@ -1056,29 +1249,47 @@ def main():
             matched_pairs["BackSign"] = _sign(matched_pairs["BackPnL"])
             opposite = matched_pairs[(matched_pairs["LiveSign"] * matched_pairs["BackSign"]) == -1].copy()
         else:
-            opposite = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LivePnL","BackPnL","LivePremium","BackPremium"])
+            opposite = pd.DataFrame(columns=["Strategy","Side","OpenDT_Live","OpenDT_Back","LiveStrikes","BackStrikes","LiveCredit","BackCredit","LiveStop","BackStop","LiveSlippage","BackSlippage","LivePnL","BackPnL","LivePremium","BackPremium"])
 
         opp_live_pnl = pd.to_numeric(opposite.get("LivePnL", pd.Series(dtype=float)), errors="coerce").sum()
         opp_back_pnl = pd.to_numeric(opposite.get("BackPnL", pd.Series(dtype=float)), errors="coerce").sum()
         opp_pnl_diff = opp_live_pnl - opp_back_pnl
 
         st.markdown("### Detail Tables")
+
+        _PAIR_ORDER = ["Strategy","Side","OpenDT_Live","OpenDT_Back","LiveStrikes","BackStrikes",
+                       "LiveCredit","BackCredit","LiveStop","BackStop","LiveSlippage","BackSlippage",
+                       "LivePremium","BackPremium","LivePnL","BackPnL"]
+
+        def _pair_cols(df: pd.DataFrame) -> pd.DataFrame:
+            """Drop internals and order the pair columns so Live/Backtest sit side by side."""
+            out = df.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in df.columns])
+            ordered = [c for c in _PAIR_ORDER if c in out.columns]
+            return out[ordered + [c for c in out.columns if c not in ordered]]
+
         live_only_pnl = pd.to_numeric(live_only.get("PnL_rounded", 0), errors="coerce").sum()
         back_only_pnl = pd.to_numeric(back_only.get("PnL_rounded", 0), errors="coerce").sum()
-        with st.expander(f"Trades only in Live (after tolerance match) — PnL: ${live_only_pnl:,.2f}"):
+        with st.expander(f"Trades only in Live (after tolerance match) — PnL: ${live_only_pnl:,.2f}"
+                         f" | Avg Slippage: {_slip_txt(_avg_slippage(live_only))}"):
             st.markdown(lvb_render_table_html(live_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
-        with st.expander(f"Trades only in Backtest (after tolerance match) — PnL: ${back_only_pnl:,.2f}"):
+        with st.expander(f"Trades only in Backtest (after tolerance match) — PnL: ${back_only_pnl:,.2f}"
+                         f" | Avg Slippage: {_slip_txt(_avg_slippage(back_only))}"):
             st.markdown(lvb_render_table_html(back_only, ["PremiumSold"], [], ["PnL_rounded"], True, 1), unsafe_allow_html=True)
         with st.expander(f"Matched pairs with opposite outcomes — Live PnL: ${opp_live_pnl:,.2f} | Backtest PnL: ${opp_back_pnl:,.2f} | Diff: ${opp_pnl_diff:,.2f}"):
-            opp_display = opposite.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in opposite.columns])
-            st.markdown(lvb_render_table_html(opp_display, [], [], ["LivePnL","BackPnL"], True, 1), unsafe_allow_html=True)
+            opp_display = _pair_cols(opposite)
+            st.markdown(lvb_render_table_html(opp_display, [], [], ["LivePnL","BackPnL"], True, 1,
+                                              strike_cols=("LiveStrikes","BackStrikes")), unsafe_allow_html=True)
         all_live_pnl = pd.to_numeric(matched_pairs.get("LivePnL", pd.Series(dtype=float)), errors="coerce").sum()
         all_back_pnl = pd.to_numeric(matched_pairs.get("BackPnL", pd.Series(dtype=float)), errors="coerce").sum()
         all_pnl_diff = all_live_pnl - all_back_pnl
-        with st.expander(f"All matched pairs (details) — Live PnL: ${all_live_pnl:,.2f} | Backtest PnL: ${all_back_pnl:,.2f} | Diff: ${all_pnl_diff:,.2f}"):
-            pairs_display = matched_pairs.drop(columns=[c for c in ["LiveIdx","BackIdx","LiveSign","BackSign"] if c in matched_pairs.columns])
+        pair_live_slip = pd.to_numeric(matched_pairs.get("LiveSlippage", pd.Series(dtype=float)), errors="coerce").mean()
+        pair_back_slip = pd.to_numeric(matched_pairs.get("BackSlippage", pd.Series(dtype=float)), errors="coerce").mean()
+        with st.expander(f"All matched pairs (details) — Live PnL: ${all_live_pnl:,.2f} | Backtest PnL: ${all_back_pnl:,.2f} | Diff: ${all_pnl_diff:,.2f}"
+                         f" | Avg Slippage — Live: {_slip_txt(pair_live_slip)} | Backtest: {_slip_txt(pair_back_slip)}"):
+            pairs_display = _pair_cols(matched_pairs)
             pairs_display = pairs_display.sort_values(["Strategy", "OpenDT_Live", "Side"]).reset_index(drop=True)
-            st.markdown(lvb_render_table_html(pairs_display, [], [], ["LivePnL","BackPnL"], True, 2), unsafe_allow_html=True)
+            st.markdown(lvb_render_table_html(pairs_display, [], [], ["LivePnL","BackPnL"], True, 2,
+                                              strike_cols=("LiveStrikes","BackStrikes")), unsafe_allow_html=True)
 
         st.markdown("### Downloads")
         c1, c2, c3, c4 = st.columns(4)
